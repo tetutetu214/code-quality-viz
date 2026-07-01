@@ -1,0 +1,3 @@
+# このツールが使う唯一の外部ライブラリ（解析自体は Python 標準ライブラリ ast のみ）。
+# st.html(unsafe_allow_javascript=...) を使うため 1.50 以上を要求する。
+streamlit>=1.50
