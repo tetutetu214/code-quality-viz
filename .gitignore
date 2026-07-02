@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 venv/
 *.testmap.json
+.coverage
+coverage.json
+.pytest_cache/

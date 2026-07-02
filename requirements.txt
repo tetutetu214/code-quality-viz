@@ -1,3 +1,11 @@
-# このツールが使う唯一の外部ライブラリ（解析自体は Python 標準ライブラリ ast のみ）。
-# st.html(unsafe_allow_javascript=...) を使うため 1.50 以上を要求する。
+# 貼り付けモードの解析は Python 標準ライブラリ ast のみ（外部依存なし）。
+# st.html(unsafe_allow_javascript=...) を使うため streamlit は 1.50 以上を要求する。
 streamlit>=1.50
+
+# フォルダ解析モード（カバレッジ×複雑度）で実行時に使う。
+# pytest でテストを実行し、pytest-cov/coverage で行・分岐カバレッジを測り、
+# radon で複雑度を測って突き合わせる（cross_check.py が subprocess で呼ぶ）。
+pytest>=8.0
+pytest-cov>=5.0
+coverage>=7.0
+radon>=6.0
