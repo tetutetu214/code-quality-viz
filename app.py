@@ -14,13 +14,117 @@
 
 import html
 import json
+import os
 
 import streamlit as st
 
+import cross_check
 import link_analyzer
 
 
 st.set_page_config(page_title="テスト×関数 紐付けビューア", layout="wide")
+
+# 解析用フォルダ。ここに「本物の .py ファイル」を置き、画面から選んで解析する。
+WORKSPACE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace")
+
+
+def render_workspace_mode():
+    """フォルダ解析モード: 実ファイルのテストを実行し複雑度×実カバレッジを出す.
+
+    貼り付けモードと違い, コードは貼らせず workspace/ 内の実ファイルを選ばせる。
+    coverage.py は「実際にテストを実行して観測する」ため, 実体ファイルが必須。
+    選んだテストをその場で実行するので, ローカル自用専用（任意コード実行に相当）。
+    """
+    st.title("フォルダ解析（カバレッジ×複雑度）")
+    st.caption(
+        "workspace/ に置いた本物のファイルを選ぶと、そのテストを実際に実行して"
+        "行・分岐カバレッジを測り、radon の複雑度と突き合わせます。"
+        "「複雑なのに実際に通っていない分岐が多い関数」ほどリスク上位に出ます。"
+        "静的な貼り付けモードと違い実行を伴うため、ローカル自用専用です。"
+    )
+
+    if not os.path.isdir(WORKSPACE_DIR):
+        st.warning(f"解析用フォルダがありません: {WORKSPACE_DIR}")
+        st.stop()
+
+    py_files = sorted(f for f in os.listdir(WORKSPACE_DIR) if f.endswith(".py"))
+    if not py_files:
+        st.info("workspace/ に .py ファイルを置いてください（処理側とテストの2つ）。")
+        st.stop()
+
+    # 既定選択: テストは test_ 始まり、処理側はそれ以外を優先で拾う。
+    tests = [f for f in py_files if f.startswith("test_")]
+    sources = [f for f in py_files if not f.startswith("test_")]
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        source_file = st.selectbox(
+            "処理側ファイル",
+            py_files,
+            index=py_files.index(sources[0]) if sources else 0,
+            help="複雑度（radon）とカバレッジ対象。",
+        )
+    with col_b:
+        test_file = st.selectbox(
+            "テストファイル",
+            py_files,
+            index=py_files.index(tests[0]) if tests else 0,
+            help="実際に実行するテスト。",
+        )
+
+    # カバレッジ対象モジュール名は処理側ファイルの拡張子を除いた名前。
+    cov_target = os.path.splitext(source_file)[0]
+    st.caption(f"カバレッジ対象モジュール: `{cov_target}`（{source_file} から自動）")
+
+    if not st.button("解析する", type="primary"):
+        st.stop()
+
+    with st.spinner("テストを実行してカバレッジを測定中…"):
+        result = cross_check.analyze_project(
+            project_dir=WORKSPACE_DIR,
+            cov_target=cov_target,
+            source_file=source_file,
+            test_path=test_file,
+        )
+
+    if not result["ok"]:
+        st.error("テストが全ては通りませんでした。pytest の出力を確認してください。")
+    if result["error"]:
+        st.error(result["error"])
+    if result["pytest_output"]:
+        with st.expander("pytest の実行ログ", expanded=not result["ok"]):
+            st.code(result["pytest_output"])
+
+    rows = result["rows"]
+    if not rows:
+        st.stop()
+
+    # 表示用に整形（リスク降順は analyze_project 内で済み）。
+    display = [
+        {
+            "注意": "⚠" if r["attention"] else "",
+            "関数": r["name"],
+            "複雑度": r["complexity"],
+            "行%": None if r["line_pct"] is None else round(r["line_pct"], 1),
+            "分岐%": None if r["branch_pct"] is None else round(r["branch_pct"], 1),
+            "リスク": round(r["risk"], 1),
+        }
+        for r in rows
+    ]
+
+    attention = [r for r in rows if r["attention"]]
+    m1, m2 = st.columns(2)
+    m1.metric("関数の数", len(rows))
+    m2.metric(f"⚠ 複雑度≥{cross_check.COMPLEXITY_THRESHOLD}かつ分岐<100%", len(attention))
+
+    st.subheader("複雑度 × 実カバレッジ")
+    st.caption(
+        "リスク = 複雑度 ×（1 − 分岐カバレッジ率）。複雑度は「分かれ道の数」、"
+        "分岐% は「実際に通った分かれ道の割合」。両方揃うと、静的だけ・動的だけ"
+        "では出せない『複雑なのにカバーが薄い関数』が上に出ます。"
+    )
+    st.dataframe(display, width="stretch", hide_index=True)
+    st.stop()
 
 # --- セッション状態の初期化 ---
 if "src_code" not in st.session_state:
@@ -29,6 +133,24 @@ if "test_code" not in st.session_state:
     st.session_state.test_code = ""
 if "analyzed" not in st.session_state:
     st.session_state.analyzed = False
+
+# --- モード切替 ---
+# 貼り付け(静的): コードを貼って ast だけで紐付け・複雑度を見る。実行しない。
+# フォルダ解析(動的): 実ファイルのテストを実行し、実カバレッジ×複雑度を見る。
+with st.sidebar:
+    st.header("モード")
+    mode = st.radio(
+        "解析の種類",
+        ["貼り付け（静的マトリクス）", "フォルダ解析（カバレッジ×複雑度）"],
+        help=(
+            "貼り付けは ast だけの静的解析（実行しない・偽陽性あり）。"
+            "フォルダ解析はテストを実際に実行して実カバレッジを測る（実測）。"
+        ),
+    )
+
+if mode.startswith("フォルダ"):
+    render_workspace_mode()
+    # render 内で st.stop() するのでここには到達しない。
 
 st.title("テスト×関数 紐付けビューア")
 st.caption(

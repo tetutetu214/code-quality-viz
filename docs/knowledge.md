@@ -24,3 +24,12 @@
 - **coverage の「受け取る」＝ coverage json**: `coverage report` は人間向けの表、`coverage json` は別プログラムが読む機械可読データ。掛け合わせ層は後者を受け取る。
 - **限界（正直な認識）**: リスクは複雑度×未通過分岐なので、複雑度1で行0%（分岐なし）の関数は ⚠ に上がらない。単純だが未実行の関数は行% で別途拾う住み分け。
 - ツール導入は `.venv/`（gitignore 済み）に pytest/pytest-cov/coverage/radon。`.coverage`・`coverage.json`・`.pytest_cache/` も gitignore に追加。
+
+### 2026-07-02 貼り付けUIとカバレッジは両立しない → フォルダ解析モードで解決
+- **矛盾の正体**: 貼り付けアプリは「2つのテキスト文字列を ast で読むだけ」で実体が無い。coverage.py は「本物のファイルのテストを実行して観測する」ため実体ファイルが必須。よって貼り付けた文字列にカバレッジは載せられない（水と油）。
+- **解決策（てつてつ発案）**: コードを貼らせず、`workspace/` に置いた実ファイルを画面から選ばせる。処理側ファイルとテストファイルを選び、アプリがその場でテスト実行→カバレッジ測定→複雑度と突き合わせ。実体があるので coverage が普通に動く。
+- **実装**: サイドバーでモード切替（貼り付け=静的マトリクス / フォルダ解析=カバレッジ×複雑度）。既存の貼り付けフローは壊さず、新モード選択時は `render_workspace_mode()` を描画して `st.stop()`。`cross_check.analyze_project(project_dir, cov_target, source_file, test_path)` が `python -m pytest --cov=... --cov-branch --cov-report=json:` を subprocess 実行し、radon と突き合わせて行リストを返す。一時 coverage.json は使用後に削除。
+- **実行系の注意**: radon は PATH 非依存で確実に呼ぶため `python -m radon` を使う（Streamlit の venv から起動できる）。pytest は `--cov-report=json:<path>` で coverage.json を直接出せる。coverage の記録パスは cwd 依存で相対/絶対が揺れるため、ファイルキーは basename でも照合する（`_match_file_key`）。
+- **セキュリティ**: 選んだテストを実際に実行する＝任意コード実行に相当。ローカル自用専用とし、画面にも明記。Web 公開はしない。
+- **テスト**: AppTest で両モードのスモーク（切替・実行・表表示が例外なし）、cross_check は build_rows・load_coverage・basename照合・analyze_project(統合) を検証。全 51 件パス。
+- **runtime 依存**: フォルダ解析は pytest/pytest-cov/coverage/radon を実行時に使うため requirements.txt に追加（貼り付けモードは従来どおり ast のみで外部依存なし）。

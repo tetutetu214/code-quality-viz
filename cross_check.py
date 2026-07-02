@@ -28,6 +28,7 @@
 """
 
 import json
+import os
 import subprocess
 import sys
 
@@ -36,21 +37,28 @@ import sys
 COMPLEXITY_THRESHOLD = 6
 
 
-def load_complexity(source_path: str) -> dict:
+def load_complexity(source_path: str, cwd: str = None, python: str = None) -> dict:
     """radon cc をソースに掛け, 関数キー -> {complexity, rank} の辞書を返す.
 
     キーの作り方は coverage.json 側に合わせる:
     メソッドは 'クラス名.メソッド名', トップレベル関数は '関数名'.
+
+    python -m radon で呼ぶ（PATH に radon が無い環境=Streamlit の venv からでも
+    確実に起動できるようにするため）。cwd を渡すとその作業ディレクトリで実行する。
     """
+    python = python or sys.executable
     proc = subprocess.run(
-        ["radon", "cc", source_path, "-j"],
+        [python, "-m", "radon", "cc", source_path, "-j"],
         capture_output=True,
         text=True,
         check=True,
+        cwd=cwd,
     )
     data = json.loads(proc.stdout)
     result = {}
-    for block in data.get(source_path, []):
+    # radon の出力キーは渡したパスそのもの。1 ファイル分だけ取り出す。
+    blocks = data.get(source_path) or next(iter(data.values()), [])
+    for block in blocks:
         # class 自体の複雑度行は関数単位の突き合わせでは使わないので飛ばす。
         if block["type"] == "class":
             continue
@@ -60,18 +68,32 @@ def load_complexity(source_path: str) -> dict:
     return result
 
 
+def _match_file_key(files: dict, source_path: str) -> str:
+    """coverage.json の files から source_path に対応するキーを探す.
+
+    coverage の記録パスは実行時の作業ディレクトリ依存で相対にも絶対にもなり得る。
+    まず完全一致, 無ければファイル名（basename）一致で拾う。
+    """
+    if source_path in files:
+        return source_path
+    base = os.path.basename(source_path)
+    for key in files:
+        if os.path.basename(key) == base:
+            return key
+    raise KeyError(
+        f"coverage.json に {source_path} が見つからない。"
+        f"含まれるのは: {list(files.keys())}"
+    )
+
+
 def load_coverage(coverage_json_path: str, source_path: str) -> dict:
     """coverage.json から, 関数キー -> {line_pct, branch_pct} の辞書を返す."""
     with open(coverage_json_path, encoding="utf-8") as f:
         data = json.load(f)
     files = data["files"]
-    if source_path not in files:
-        raise KeyError(
-            f"coverage.json に {source_path} が無い。"
-            f"含まれるのは: {list(files.keys())}"
-        )
+    file_key = _match_file_key(files, source_path)
     result = {}
-    for name, info in files[source_path]["functions"].items():
+    for name, info in files[file_key]["functions"].items():
         if name == "":
             # モジュール直下（関数の外）はカバレッジ対象だが突き合わせ対象外。
             continue
@@ -144,6 +166,69 @@ def format_table(rows: list) -> str:
             f'{r["risk"]:>8.1f}  {mark}'
         )
     return "\n".join(lines)
+
+
+def analyze_project(
+    project_dir: str,
+    cov_target: str,
+    source_file: str,
+    test_path: str,
+    python: str = None,
+) -> dict:
+    """実プロジェクトのテストを実行し, 複雑度×実カバレッジの行リストを返す.
+
+    Args:
+        project_dir: テストを実行する作業ディレクトリ（本物のフォルダ）。
+        cov_target:  カバレッジ対象。pytest の --cov に渡す（例: 'sample_module'）。
+        source_file: radon を掛ける処理側ファイル（project_dir からの相対、
+                     例: 'sample_module.py'）。
+        test_path:   実行するテスト（project_dir からの相対、例: 'test_x.py'）。
+        python:      使う Python 実行体。既定は現在の実行体（＝この venv）。
+
+    Returns:
+        dict:
+            ok: bool               pytest が全て通ったか（returncode==0）
+            rows: list             build_rows の結果（カバレッジが取れた場合）
+            pytest_output: str     pytest の標準出力＋標準エラー（失敗時の確認用）
+            error: str or None     カバレッジ突き合わせに失敗した場合の理由
+    """
+    python = python or sys.executable
+    # coverage.json は一時ファイルに出す（project_dir を汚さない）。
+    cov_json = os.path.join(project_dir, ".cross_check_cov.json")
+    cmd = [
+        python, "-m", "pytest", test_path,
+        f"--cov={cov_target}", "--cov-branch",
+        f"--cov-report=json:{cov_json}", "-q",
+    ]
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True, cwd=project_dir
+    )
+    output = proc.stdout + proc.stderr
+
+    result = {
+        "ok": proc.returncode == 0,
+        "rows": [],
+        "pytest_output": output,
+        "error": None,
+    }
+
+    # テストが落ちても coverage.json が出ていれば突き合わせは試みる
+    # （実測できた分だけでも見せたいため）。
+    if not os.path.exists(cov_json):
+        result["error"] = "coverage.json が生成されませんでした（テスト実行に失敗）。"
+        return result
+
+    try:
+        complexity = load_complexity(source_file, cwd=project_dir, python=python)
+        coverage = load_coverage(cov_json, source_file)
+        result["rows"] = build_rows(complexity, coverage)
+    except (KeyError, subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        result["error"] = f"複雑度×カバレッジの突き合わせに失敗: {e}"
+    finally:
+        # 一時ファイルは残さない。
+        if os.path.exists(cov_json):
+            os.remove(cov_json)
+    return result
 
 
 def main(argv: list) -> int:

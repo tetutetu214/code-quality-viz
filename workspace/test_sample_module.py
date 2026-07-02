@@ -7,7 +7,7 @@
 
 import unittest
 
-import link_analyzer
+import sample_module as link_analyzer
 
 
 class TestAnalyzeSource(unittest.TestCase):

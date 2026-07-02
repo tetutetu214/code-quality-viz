@@ -86,5 +86,56 @@ class TestLoadCoverage(unittest.TestCase):
             cross_check.load_coverage(path, "存在しない.py")
 
 
+class TestMatchFileKey(unittest.TestCase):
+    """coverage.json のファイルキー照合（相対/絶対の揺れ吸収）."""
+
+    def test_完全一致のキーをそのまま返す(self):
+        files = {"pkg/mod.py": {}}
+        self.assertEqual(cross_check._match_file_key(files, "pkg/mod.py"), "pkg/mod.py")
+
+    def test_ファイル名一致でキーを拾う(self):
+        # coverage 側が絶対パスでも, 渡した相対名の basename で拾える.
+        files = {"/abs/path/to/mod.py": {}}
+        self.assertEqual(
+            cross_check._match_file_key(files, "mod.py"), "/abs/path/to/mod.py"
+        )
+
+    def test_一致が無ければKeyError(self):
+        with self.assertRaises(KeyError):
+            cross_check._match_file_key({"a.py": {}}, "b.py")
+
+
+class TestAnalyzeProject(unittest.TestCase):
+    """実ファイルのテスト実行〜複雑度×カバレッジ突き合わせ（統合）.
+
+    workspace/ の本物のファイルに対して pytest を実際に走らせる。
+    外部プロセスの実行を伴うが, 実測経路そのものに意味があるためモックしない。
+    """
+
+    def _workspace(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(here, "workspace")
+
+    def test_サンプルを解析するとテストが通り関数行が返る(self):
+        result = cross_check.analyze_project(
+            project_dir=self._workspace(),
+            cov_target="sample_module",
+            source_file="sample_module.py",
+            test_path="test_sample_module.py",
+        )
+        self.assertTrue(result["ok"])
+        self.assertGreater(len(result["rows"]), 0)
+
+    def test_一時的なcoverage_jsonを残さない(self):
+        cross_check.analyze_project(
+            project_dir=self._workspace(),
+            cov_target="sample_module",
+            source_file="sample_module.py",
+            test_path="test_sample_module.py",
+        )
+        leftover = os.path.join(self._workspace(), ".cross_check_cov.json")
+        self.assertFalse(os.path.exists(leftover))
+
+
 if __name__ == "__main__":
     unittest.main()
