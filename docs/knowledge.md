@@ -15,3 +15,12 @@
 - details-on-demand（セルクリックで実コードをポップアップ / 関数クリックでジャンプ）は Streamlit で重いため今回スコープ外。ホバーのツールチップに留める。
 - グルーピングの粒度: 1ファイル前提のため「機能モジュール」はクラス粒度まで。モジュール直下の関数は「(モジュール直下)」グループにまとめる。
 - 配色: 赤/緑を避け赤/青＋記号併用（色覚多様性への配慮）。
+
+### 2026-07-02 静的解析の限界を実測で確認し、静的×動的のハイブリッドへ
+- **link_analyzer のテスト漏れ判定は偽陽性が出る（実測で確定）**: link_analyzer は「テストから名指し（`link_analyzer.xxx(...)`）で呼ばれた関数」しか証拠に拾えず、公開関数の内部で間接的に動く `_measure_function` などのヘルパーを一律「未テスト」と誤判定する。link_analyzer 自身を対象に `pytest --cov=link_analyzer --cov-branch` を回すと、誤判定されたヘルパーは実測で `_measure_function` 100%・`_visit_branch` 100%・`_make_insights` 86% とちゃんとカバーされていた。原因はコードを実行しない静的解析だから。
+- **逆に動的計測でしか出ない本物の穴が見つかった**: `visit_comprehension`・`visit_FunctionDef`・`visit_AsyncFunctionDef` が行0%（内包表記/ネスト関数/`async def` をテストで一度も食わせていない）、`visit_Assign`/`visit_Call` が分岐50%。静的な名指し紐付けでは原理的に見えない。
+- **役割分担の結論**: ①どの関数が実際に動いたか（カバレッジ）→ coverage.py / pytest-cov（動的）に置き換える。②複雑度・LOC 等の静的メトリクス → radon を採用（自前 `_ComplexityVisitor` を保守しなくて済む＋Halstead/MI も標準で出る。※「複雑度の正確さで radon が勝つ」わけではない）。③両者を突き合わせる薄い層を新設。
+- **掛け合わせ層 `cross_check.py` を試作**: radon の複雑度 × coverage.json の関数別カバレッジを関数名（メソッドは `Class.method`）で突き合わせ、`リスク = 複雑度 ×（1 − 分岐カバレッジ率）` で降順表示。`複雑度≥6 かつ 分岐<100%` を ⚠。複雑度は「分かれ道の数」、分岐カバレッジは「実際に通った分かれ道」で対になる。
+- **coverage の「受け取る」＝ coverage json**: `coverage report` は人間向けの表、`coverage json` は別プログラムが読む機械可読データ。掛け合わせ層は後者を受け取る。
+- **限界（正直な認識）**: リスクは複雑度×未通過分岐なので、複雑度1で行0%（分岐なし）の関数は ⚠ に上がらない。単純だが未実行の関数は行% で別途拾う住み分け。
+- ツール導入は `.venv/`（gitignore 済み）に pytest/pytest-cov/coverage/radon。`.coverage`・`coverage.json`・`.pytest_cache/` も gitignore に追加。
