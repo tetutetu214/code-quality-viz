@@ -138,6 +138,8 @@ class _SourceCollector(ast.NodeVisitor):
         self.functions = {}
         # 素の名前 -> 表示名のリスト (呼び出し解決用).
         self.simple_to_display = defaultdict(list)
+        # 表示名 -> 定義ノード (呼び出し関係の抽出用).
+        self.nodes = {}
         self._class_stack = []
 
     def visit_ClassDef(self, node):
@@ -153,6 +155,7 @@ class _SourceCollector(ast.NodeVisitor):
             display = simple
         self.functions[display] = _measure_function(node)
         self.simple_to_display[simple].append(display)
+        self.nodes[display] = node
 
     def visit_FunctionDef(self, node):
         self._register(node)
@@ -164,6 +167,55 @@ class _SourceCollector(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+class _CallCollector(ast.NodeVisitor):
+    """1 つの関数本体をたどり, 同じファイル内の関数を呼んでいる素の名前を集める.
+
+    入れ子関数の中には潜らない (その呼び出しは入れ子関数側のものだから)。
+    foo() は Name, self._x() / obj.method() は Attribute の末尾名で拾う。
+    """
+
+    def __init__(self, known_simple: set):
+        self.known = known_simple
+        self.calls = set()
+
+    def visit_FunctionDef(self, node):
+        pass
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Call(self, node):
+        func = node.func
+        name = None
+        if isinstance(func, ast.Name):
+            name = func.id
+        elif isinstance(func, ast.Attribute):
+            name = func.attr
+        if name in self.known:
+            self.calls.add(name)
+        self.generic_visit(node)
+
+
+def _compute_calls(nodes: dict, simple_to_display: dict) -> dict:
+    """関数表示名 -> その関数が呼ぶ同ファイル内の関数(表示名)のリスト を作る.
+
+    素の名前が処理側で一意に解決できるものだけを辺にする (同名が複数なら曖昧
+    なので張らない)。自分自身への辺は除く。
+    """
+    known = set(simple_to_display.keys())
+    calls = {}
+    for display, node in nodes.items():
+        collector = _CallCollector(known)
+        for child in node.body:
+            collector.visit(child)
+        callees = []
+        for simple in collector.calls:
+            targets = simple_to_display.get(simple, [])
+            if len(targets) == 1 and targets[0] != display:
+                callees.append(targets[0])
+        calls[display] = sorted(set(callees))
+    return calls
+
+
 def analyze_source(source: str) -> dict:
     """処理側コードを解析する.
 
@@ -171,6 +223,7 @@ def analyze_source(source: str) -> dict:
         dict:
             functions: dict[str, dict]        関数表示名 -> 指標
             simple_to_display: dict[str,list] 素の名前 -> 表示名リスト
+            calls: dict[str, list]            関数 -> 呼んでいる同ファイル内関数
             syntax_error: str or None
     """
     try:
@@ -183,9 +236,11 @@ def analyze_source(source: str) -> dict:
     simple_map = {
         k: list(v) for k, v in collector.simple_to_display.items()
     }
+    calls = _compute_calls(collector.nodes, simple_map)
     return {
         "functions": collector.functions,
         "simple_to_display": simple_map,
+        "calls": calls,
         "syntax_error": None,
     }
 
