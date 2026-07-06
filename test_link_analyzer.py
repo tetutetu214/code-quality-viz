@@ -267,6 +267,87 @@ class TestBuildLinks(unittest.TestCase):
         self.assertIn("テスト不足注意", joined)
 
 
+class TestMultiFileAnalysis(unittest.TestCase):
+    """複数ファイル解析の統合と衝突回避."""
+
+    def test_同名関数が複数ファイルにある場合はファイル名付きで区別する(self):
+        """同じ表示名が衝突した関数だけ ファイル名.関数名 になる."""
+        result = link_analyzer.analyze_source_files({
+            "alpha.py": "def run():\n    return 1\n",
+            "beta.py": "def run():\n    return 2\n",
+        })
+        self.assertIn("alpha.py.run", result["functions"])
+        self.assertIn("beta.py.run", result["functions"])
+
+    def test_同名関数はimport文のモジュール名で紐付けられる(self):
+        """from alpha import run は alpha.py の run に紐づく."""
+        src = link_analyzer.analyze_source_files({
+            "alpha.py": "def run():\n    return 1\n",
+            "beta.py": "def run():\n    return 2\n",
+        })
+        tests = link_analyzer.analyze_test_files({
+            "test_alpha.py": (
+                "from alpha import run\n"
+                "class TestRun(unittest.TestCase):\n"
+                "    def test_run(self):\n"
+                "        run()\n"
+            )
+        })
+        link = link_analyzer.build_links(src, tests)
+        classes = [e["cls"] for e in link["func_to_tests"]["alpha.py.run"]]
+        self.assertIn("TestRun", classes)
+        self.assertIn("beta.py.run", link["untested"])
+
+    def test_同名関数がimportで解決できない場合は保留する(self):
+        """import 情報が無い同名関数呼び出しは unresolved に残る."""
+        src = link_analyzer.analyze_source_files({
+            "alpha.py": "def run():\n    return 1\n",
+            "beta.py": "def run():\n    return 2\n",
+        })
+        tests = link_analyzer.analyze_test_files({
+            "test_run.py": (
+                "class TestRun(unittest.TestCase):\n"
+                "    def test_run(self):\n"
+                "        run()\n"
+            )
+        })
+        link = link_analyzer.build_links(src, tests)
+        self.assertIn("run", link["unresolved"]["TestRun"])
+
+    def test_同名テストクラスが複数ファイルにある場合はファイル名付きで区別する(self):
+        """同じテストクラス名は test_file.py::ClassName になる."""
+        result = link_analyzer.analyze_test_files({
+            "test_alpha.py": "class TestRun(unittest.TestCase):\n    pass\n",
+            "test_beta.py": "class TestRun(unittest.TestCase):\n    pass\n",
+        })
+        self.assertIn("test_alpha.py::TestRun", result["classes"])
+        self.assertIn("test_beta.py::TestRun", result["classes"])
+
+    def test_一部の処理側ファイルだけ構文エラーならファイル名が残る(self):
+        """複数処理側の構文エラーはファイル別に返る."""
+        result = link_analyzer.analyze_source_files({
+            "ok.py": "def ok():\n    return 1\n",
+            "broken.py": "def broken(:\n    pass\n",
+        })
+        self.assertIn("broken.py", result["syntax_errors"])
+
+    def test_一部のテストファイルだけ構文エラーならファイル名が残る(self):
+        """複数テスト側の構文エラーはファイル別に返る."""
+        result = link_analyzer.analyze_test_files({
+            "test_ok.py": "class TestOk(unittest.TestCase):\n    pass\n",
+            "test_broken.py": "class TestBroken(:\n    pass\n",
+        })
+        self.assertIn("test_broken.py", result["syntax_errors"])
+
+    def test_一ファイル解析では従来の関数名を保つ(self):
+        """1 ファイルだけなら衝突回避の接頭辞を付けない."""
+        result = link_analyzer.analyze_source_files({
+            "alpha.py": "def run():\n    return 1\n",
+        })
+        self.assertIn("run", result["functions"])
+        self.assertNotIn("alpha.py.run", result["functions"])
+
+
 class TestComplexityEdgeCases(unittest.TestCase):
     """複雑度計測の, 内包表記・入れ子関数・async 経路."""
 

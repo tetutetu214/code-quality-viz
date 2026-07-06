@@ -97,6 +97,34 @@ def status_label(tested: bool, line, branch, complexity: int) -> str:
     return base
 
 
+def _read_workspace_files(filenames: list) -> dict:
+    """workspace/ の選択ファイルを読み込む."""
+    result = {}
+    for filename in filenames:
+        with open(os.path.join(WORKSPACE_DIR, filename), encoding="utf-8") as f:
+            result[filename] = f.read()
+    return result
+
+
+def _format_syntax_errors(errors: dict) -> str:
+    """ファイル別の構文エラーを画面表示用に整える."""
+    return "\n".join(f"- {name}: {message}" for name, message in errors.items())
+
+
+def _cov_row_key(row: dict, file_by_function: dict) -> str | None:
+    """coverage/radon の行を静的解析側の関数キーへ対応させる."""
+    source_file = row.get("file")
+    name = row["name"]
+    for func, filename in file_by_function.items():
+        if filename == source_file and func == name:
+            return func
+    prefixed = f"{source_file}.{name}"
+    for func, filename in file_by_function.items():
+        if filename == source_file and func == prefixed:
+            return func
+    return None
+
+
 # =====================================================================
 # 詳細ビュー: 関数×テストクラスの紐付きマトリクス (expander の中で使う)
 # =====================================================================
@@ -239,40 +267,45 @@ sources = [f for f in py_files if not f.startswith("test_")]
 
 col_a, col_b = st.columns(2)
 with col_a:
-    source_file = st.selectbox(
+    source_files = st.multiselect(
         "処理側ファイル",
         py_files,
-        index=py_files.index(sources[0]) if sources else 0,
+        default=sources,
         help="関数の抽出・複雑度・カバレッジの対象。",
     )
 with col_b:
-    test_file = st.selectbox(
+    test_files = st.multiselect(
         "テストファイル",
         py_files,
-        index=py_files.index(tests[0]) if tests else 0,
+        default=tests,
         help="実際に実行するテスト。",
     )
 
-cov_target = os.path.splitext(source_file)[0]
-st.caption(f"カバレッジ対象モジュール: `{cov_target}`（{source_file} から自動）")
+cov_targets = [os.path.splitext(source_file)[0] for source_file in source_files]
+st.caption(
+    "カバレッジ対象モジュール: "
+    + (", ".join(f"`{target}`" for target in cov_targets) or "未選択")
+)
 
 if not st.button("解析する", type="primary"):
     st.stop()
 
-# --- 静的解析 ---
-with open(os.path.join(WORKSPACE_DIR, source_file), encoding="utf-8") as f:
-    src_code = f.read()
-with open(os.path.join(WORKSPACE_DIR, test_file), encoding="utf-8") as f:
-    test_code = f.read()
-
-src_result = link_analyzer.analyze_source(src_code)
-test_result = link_analyzer.analyze_tests(test_code)
-
-if src_result.get("syntax_error"):
-    st.error(f"処理側コードの構文エラー: {src_result['syntax_error']}")
+if not source_files:
+    st.error("処理側ファイルを 1 つ以上選んでください。")
     st.stop()
-if test_result.get("syntax_error"):
-    st.error(f"テストコードの構文エラー: {test_result['syntax_error']}")
+if not test_files:
+    st.error("テストファイルを 1 つ以上選んでください。")
+    st.stop()
+
+# --- 静的解析 ---
+src_result = link_analyzer.analyze_source_files(_read_workspace_files(source_files))
+test_result = link_analyzer.analyze_test_files(_read_workspace_files(test_files))
+
+if src_result.get("syntax_errors"):
+    st.error("処理側コードの構文エラー:\n" + _format_syntax_errors(src_result["syntax_errors"]))
+    st.stop()
+if test_result.get("syntax_errors"):
+    st.error("テストコードの構文エラー:\n" + _format_syntax_errors(test_result["syntax_errors"]))
     st.stop()
 if not src_result["functions"]:
     st.info("処理側に関数定義が見つかりませんでした。")
@@ -282,19 +315,22 @@ link = link_analyzer.build_links(src_result, test_result)
 functions = link["functions"]
 func_to_tests = link["func_to_tests"]
 calls = src_result["calls"]
+file_by_function = src_result.get("file_by_function", {})
 
 # --- 動的解析 ---
 with st.spinner("テストを実際に実行してカバレッジを測定中…"):
     cov = cross_check.analyze_project(
         project_dir=WORKSPACE_DIR,
-        cov_target=cov_target,
-        source_file=source_file,
-        test_path=test_file,
+        cov_target=cov_targets,
+        source_file=source_files,
+        test_path=test_files,
     )
 cov_rows = cov["rows"]
-cov_map = {
-    r["name"]: {"line": r["line_pct"], "branch": r["branch_pct"]} for r in cov_rows
-}
+cov_map = {}
+for row in cov_rows:
+    key = _cov_row_key(row, file_by_function)
+    if key:
+        cov_map[key] = {"line": row["line_pct"], "branch": row["branch_pct"]}
 
 # --- まとめ文 (素人がまず知りたいこと) ---
 n_func = len(functions)
@@ -308,6 +344,8 @@ n_tests = len(link["all_tests"])
 
 if not cov_rows:
     st.error("テスト実行に失敗したため、カバレッジを測れませんでした。下のログを確認してください。")
+    if cov.get("error"):
+        st.warning(cov["error"])
     with st.expander("pytest の実行ログ", expanded=True):
         st.code(cov["pytest_output"] or "(出力なし)")
     st.stop()
@@ -321,6 +359,8 @@ st.markdown(
     f"- テストが**名前で直接ねらっている**関数は **{n_direct} 個**。"
     f"残りはその関数の内部で連鎖的に動いています（下の表のインデントが親子関係）。"
 )
+if cov.get("error"):
+    st.warning(cov["error"])
 
 # --- 用語の凡例 (必ず定義する) ---
 with st.expander("表の言葉の意味（先に読んでください）", expanded=False):
@@ -338,30 +378,37 @@ with st.expander("表の言葉の意味（先に読んでください）", expan
         "- **状態**：上をまとめた一言。`⚠ 一度も動いていない`＝手当ての最優先候補。"
     )
 
-# --- 本体: 呼び出しツリー 1 枚 ---
+# --- 本体: 呼び出しツリーをファイルごとに縦並び ---
 st.subheader("全関数ツリー（親＝呼ぶ側 / 子＝呼ばれるヘルパー）")
-order = build_tree_order(functions, calls)
-table = []
-for name, depth in order:
-    info = cov_map.get(name)
-    line = info["line"] if info else None
-    branch = info["branch"] if info else None
-    m = functions[name]
-    tests_for = func_to_tests.get(name, [])
-    tested = bool(tests_for)
-    indent = "　" * depth + ("└ " if depth else "")
-    table.append(
-        {
-            "関数": indent + name,
-            "種類": is_public(name),
-            "複雑さ": m["complexity"],
-            "担当テスト": "／".join(t["cls"] for t in tests_for) if tested else "—",
-            "動いた": "—" if line is None else ("✓" if line > 0 else "✗"),
-            "カバー分岐%": None if branch is None else round(branch, 0),
-            "状態": status_label(tested, line, branch, m["complexity"]),
-        }
-    )
-st.dataframe(table, width="stretch", hide_index=True)
+for source_file in source_files:
+    st.markdown(f"### {source_file}")
+    file_functions = {
+        name: metrics for name, metrics in functions.items()
+        if file_by_function.get(name) == source_file
+    }
+    file_calls = src_result.get("calls_by_file", {}).get(source_file, {})
+    order = build_tree_order(file_functions, file_calls)
+    table = []
+    for name, depth in order:
+        info = cov_map.get(name)
+        line = info["line"] if info else None
+        branch = info["branch"] if info else None
+        m = functions[name]
+        tests_for = func_to_tests.get(name, [])
+        tested = bool(tests_for)
+        indent = "　" * depth + ("└ " if depth else "")
+        table.append(
+            {
+                "関数": indent + name,
+                "種類": is_public(name),
+                "複雑さ": m["complexity"],
+                "担当テスト": "／".join(t["cls"] for t in tests_for) if tested else "—",
+                "動いた": "—" if line is None else ("✓" if line > 0 else "✗"),
+                "カバー分岐%": None if branch is None else round(branch, 0),
+                "状態": status_label(tested, line, branch, m["complexity"]),
+            }
+        )
+    st.dataframe(table, width="stretch", hide_index=True)
 st.caption(
     "上から読むと「入口の公開関数 → その中で呼ばれるヘルパー」の順。"
     "『⚠ 一度も動いていない』の行があれば、そこがテストの穴です。"
