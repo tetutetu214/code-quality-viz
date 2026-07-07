@@ -145,6 +145,23 @@ def build_rows(complexity: dict, coverage: dict) -> list:
     return rows
 
 
+def build_file_rows(source_file: str, complexity: dict, coverage: dict) -> list:
+    """1 ファイル分の突き合わせ結果に由来ファイルを付ける."""
+    rows = build_rows(complexity, coverage)
+    for row in rows:
+        row["file"] = source_file
+    return rows
+
+
+def _as_list(value) -> list:
+    """単一値と複数値の両方をリストにそろえる."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
 def format_table(rows: list) -> str:
     """行リストを人間が読む表に整形する."""
 
@@ -170,19 +187,18 @@ def format_table(rows: list) -> str:
 
 def analyze_project(
     project_dir: str,
-    cov_target: str,
-    source_file: str,
-    test_path: str,
+    cov_target,
+    source_file,
+    test_path,
     python: str = None,
 ) -> dict:
     """実プロジェクトのテストを実行し, 複雑度×実カバレッジの行リストを返す.
 
     Args:
         project_dir: テストを実行する作業ディレクトリ（本物のフォルダ）。
-        cov_target:  カバレッジ対象。pytest の --cov に渡す（例: 'sample_module'）。
-        source_file: radon を掛ける処理側ファイル（project_dir からの相対、
-                     例: 'sample_module.py'）。
-        test_path:   実行するテスト（project_dir からの相対、例: 'test_x.py'）。
+        cov_target:  カバレッジ対象。pytest の --cov に渡す。複数可。
+        source_file: radon を掛ける処理側ファイル。複数可。
+        test_path:   実行するテスト。複数可。
         python:      使う Python 実行体。既定は現在の実行体（＝この venv）。
 
     Returns:
@@ -193,13 +209,23 @@ def analyze_project(
             error: str or None     カバレッジ突き合わせに失敗した場合の理由
     """
     python = python or sys.executable
+    cov_targets = _as_list(cov_target)
+    source_files = _as_list(source_file)
+    test_paths = _as_list(test_path)
+
+    if not cov_targets or not source_files or not test_paths:
+        return {
+            "ok": False,
+            "rows": [],
+            "pytest_output": "",
+            "error": "処理側ファイルとテストファイルを 1 つ以上選んでください。",
+        }
+
     # coverage.json は一時ファイルに出す（project_dir を汚さない）。
     cov_json = os.path.join(project_dir, ".cross_check_cov.json")
-    cmd = [
-        python, "-m", "pytest", test_path,
-        f"--cov={cov_target}", "--cov-branch",
-        f"--cov-report=json:{cov_json}", "-q",
-    ]
+    cmd = [python, "-m", "pytest", *test_paths]
+    cmd.extend(f"--cov={target}" for target in cov_targets)
+    cmd.extend(["--cov-branch", f"--cov-report=json:{cov_json}", "-q"])
     proc = subprocess.run(
         cmd, capture_output=True, text=True, cwd=project_dir
     )
@@ -219,9 +245,23 @@ def analyze_project(
         return result
 
     try:
-        complexity = load_complexity(source_file, cwd=project_dir, python=python)
-        coverage = load_coverage(cov_json, source_file)
-        result["rows"] = build_rows(complexity, coverage)
+        rows = []
+        missing_coverage = []
+        for current_source in source_files:
+            complexity = load_complexity(
+                current_source, cwd=project_dir, python=python
+            )
+            try:
+                coverage = load_coverage(cov_json, current_source)
+            except KeyError:
+                coverage = {}
+                missing_coverage.append(current_source)
+            rows.extend(build_file_rows(current_source, complexity, coverage))
+        rows.sort(key=lambda r: r["risk"], reverse=True)
+        result["rows"] = rows
+        if missing_coverage:
+            joined = "、".join(missing_coverage)
+            result["error"] = f"coverage に含まれないファイルがあります: {joined}"
     except (KeyError, subprocess.CalledProcessError, json.JSONDecodeError) as e:
         result["error"] = f"複雑度×カバレッジの突き合わせに失敗: {e}"
     finally:

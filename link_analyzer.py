@@ -245,6 +245,88 @@ def analyze_source(source: str) -> dict:
     }
 
 
+def analyze_source_files(sources: dict) -> dict:
+    """複数の処理側コードを解析し, 統合した解析結果を返す.
+
+    sources は ファイル名 -> ソース文字列。1 ファイルだけなら従来の表示名を
+    保ち, 複数ファイルで同じ表示名が衝突した場合だけ ファイル名.関数名 にする。
+    """
+    if not sources:
+        return {
+            "functions": {},
+            "simple_to_display": {},
+            "calls": {},
+            "syntax_errors": {},
+            "file_by_function": {},
+            "calls_by_file": {},
+            "syntax_error": None,
+        }
+
+    per_file = {}
+    syntax_errors = {}
+    for filename, source in sources.items():
+        result = analyze_source(source)
+        if result.get("syntax_error"):
+            syntax_errors[filename] = result["syntax_error"]
+        per_file[filename] = result
+
+    if syntax_errors:
+        return {
+            "functions": {},
+            "simple_to_display": {},
+            "calls": {},
+            "syntax_errors": syntax_errors,
+            "file_by_function": {},
+            "calls_by_file": {},
+            "syntax_error": None,
+        }
+
+    display_counts = defaultdict(int)
+    for result in per_file.values():
+        for display in result["functions"]:
+            display_counts[display] += 1
+
+    functions = {}
+    simple_to_display = defaultdict(list)
+    calls = {}
+    file_by_function = {}
+    calls_by_file = defaultdict(dict)
+    rename_by_file = {}
+
+    for filename, result in per_file.items():
+        rename = {}
+        for display, metrics in result["functions"].items():
+            merged = display
+            if len(per_file) > 1 and display_counts[display] > 1:
+                merged = f"{filename}.{display}"
+            rename[display] = merged
+            functions[merged] = dict(metrics)
+            file_by_function[merged] = filename
+        rename_by_file[filename] = rename
+
+        for simple, displays in result["simple_to_display"].items():
+            for display in displays:
+                simple_to_display[simple].append(rename[display])
+
+    for filename, result in per_file.items():
+        rename = rename_by_file[filename]
+        for caller, callees in result["calls"].items():
+            merged_caller = rename[caller]
+            merged_callees = [rename[callee] for callee in callees]
+            calls[merged_caller] = merged_callees
+            calls_by_file[filename][merged_caller] = merged_callees
+
+    return {
+        "functions": functions,
+        "simple_to_display": {k: v for k, v in simple_to_display.items()},
+        "calls": calls,
+        "syntax_errors": syntax_errors,
+        "file_by_function": file_by_function,
+        "calls_by_file": {k: v for k, v in calls_by_file.items()},
+        "syntax_error": None,
+    }
+
+
 # ---------------------------------------------------------------------
 # テスト側の解析
 # ---------------------------------------------------------------------
@@ -294,7 +376,7 @@ class _TestClassVisitor(ast.NodeVisitor):
 
 
 def _collect_import_aliases(tree) -> dict:
-    """import 文から「別名 -> 元の名前」の対応表を作る.
+    """import 文から「別名 -> 元の名前とモジュール」の対応表を作る.
 
     from main import check_gcs_zip_http        -> {check_gcs_zip_http: 同じ}
     from main import main as main_func         -> {main_func: main}
@@ -306,15 +388,16 @@ def _collect_import_aliases(tree) -> dict:
     aliases = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
+            module = (node.module or "").split(".")[-1]
             for alias in node.names:
                 local = alias.asname or alias.name
-                aliases[local] = alias.name
+                aliases[local] = {"name": alias.name, "module": module}
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 local = alias.asname or alias.name
                 # import a.b.c as x の元名は末尾 (呼び出し解決に合わせる).
                 original = alias.name.split(".")[-1]
-                aliases[local] = original
+                aliases[local] = {"name": original, "module": original}
     return aliases
 
 
@@ -347,21 +430,66 @@ def analyze_tests(source: str) -> dict:
         # 証拠B: self.x() のうち, self.x = 名前 で解決できたものを実名に変換.
         # 代入された名前が import の別名なら, 元の関数名へさらに読み替える.
         aliased = set()
+        name_sources = defaultdict(set)
         for attr in visitor.self_attr_calls:
             if attr in visitor.self_alias:
                 assigned = visitor.self_alias[attr]
-                resolved = import_aliases.get(assigned, assigned)
+                alias = import_aliases.get(assigned)
+                resolved = alias["name"] if alias else assigned
                 aliased.add(resolved)
+                if alias and alias["module"]:
+                    name_sources[resolved].add(alias["module"])
 
         # 直接呼び出しも, import 別名なら元名へ読み替える.
-        direct = {import_aliases.get(n, n) for n in visitor.direct_calls}
+        direct = set()
+        for name in visitor.direct_calls:
+            alias = import_aliases.get(name)
+            resolved = alias["name"] if alias else name
+            direct.add(resolved)
+            if alias and alias["module"]:
+                name_sources[resolved].add(alias["module"])
 
         classes[node.name] = {
             "direct": direct,
             "aliased": aliased,
+            "name_sources": {k: set(v) for k, v in name_sources.items()},
         }
 
     return {"classes": classes, "syntax_error": None}
+
+
+def analyze_test_files(sources: dict) -> dict:
+    """複数のテストコードを解析し, テストクラスを統合する.
+
+    同名クラスが複数ファイルにある場合は test_file.py::ClassName で区別する。
+    1 ファイルだけなら従来のクラス名を保つ。
+    """
+    if not sources:
+        return {"classes": {}, "syntax_errors": {}, "syntax_error": None}
+
+    per_file = {}
+    syntax_errors = {}
+    class_counts = defaultdict(int)
+    for filename, source in sources.items():
+        result = analyze_tests(source)
+        if result.get("syntax_error"):
+            syntax_errors[filename] = result["syntax_error"]
+        per_file[filename] = result
+        for class_name in result.get("classes", {}):
+            class_counts[class_name] += 1
+
+    if syntax_errors:
+        return {"classes": {}, "syntax_errors": syntax_errors, "syntax_error": None}
+
+    classes = {}
+    for filename, result in per_file.items():
+        for class_name, info in result["classes"].items():
+            merged = class_name
+            if len(per_file) > 1 and class_counts[class_name] > 1:
+                merged = f"{filename}::{class_name}"
+            classes[merged] = info
+
+    return {"classes": classes, "syntax_errors": {}, "syntax_error": None}
 
 
 # ---------------------------------------------------------------------
@@ -399,6 +527,16 @@ def build_links(src_result: dict, test_result: dict) -> dict:
         for via, names in (("C", calls["direct"]), ("B", calls["aliased"])):
             for simple in names:
                 targets = simple_to_display.get(simple, [])
+                sources = calls.get("name_sources", {}).get(simple, set())
+                if len(targets) >= 2 and sources:
+                    matched = [
+                        target for target in targets
+                        if _function_matches_modules(
+                            target, src_result.get("file_by_function", {}), sources
+                        )
+                    ]
+                    if len(matched) == 1:
+                        targets = matched
                 if len(targets) == 1:
                     func = targets[0]
                     # 同じクラス-関数の重複は避ける (C と B 両方で来ることがある).
@@ -429,6 +567,13 @@ def build_links(src_result: dict, test_result: dict) -> dict:
         "unresolved": {k: sorted(set(v)) for k, v in unresolved.items()},
         "insights": insights,
     }
+
+
+def _function_matches_modules(func: str, file_by_function: dict, modules: set) -> bool:
+    """import 文のモジュール名が処理側ファイル名と一致するかを見る."""
+    filename = file_by_function.get(func, "")
+    stem = filename.rsplit(".", 1)[0]
+    return stem in modules
 
 
 # 複雑度の目安しきい値. 一次的な基準として保持する.

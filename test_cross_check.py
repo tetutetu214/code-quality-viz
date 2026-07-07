@@ -7,6 +7,7 @@ coverage.json をパースする load_coverage の振る舞いを検証する。
 
 import json
 import os
+import sys
 import tempfile
 import unittest
 
@@ -55,6 +56,12 @@ class TestBuildRows(unittest.TestCase):
         rows = cross_check.build_rows(complexity, coverage)
         self.assertEqual(rows[0]["risk"], 0.0)
         self.assertFalse(rows[0]["attention"])
+
+    def test_行には由来ファイルを付けられる(self):
+        complexity = {"f": {"complexity": 1, "rank": "A"}}
+        coverage = {"f": {"line_pct": 100.0, "branch_pct": 100.0}}
+        rows = cross_check.build_file_rows("alpha.py", complexity, coverage)
+        self.assertEqual(rows[0]["file"], "alpha.py")
 
 
 class TestLoadCoverage(unittest.TestCase):
@@ -135,6 +142,73 @@ class TestAnalyzeProject(unittest.TestCase):
         )
         leftover = os.path.join(self._workspace(), ".cross_check_cov.json")
         self.assertFalse(os.path.exists(leftover))
+
+    def test_複数ファイルを解析すると各行の由来ファイルが分かる(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_file(tmpdir, "alpha.py", "def a():\n    return 1\n")
+            self._write_file(tmpdir, "beta.py", "def b():\n    return 2\n")
+            self._write_file(
+                tmpdir,
+                "test_alpha.py",
+                "from alpha import a\n\n"
+                "def test_a():\n"
+                "    assert a() == 1\n",
+            )
+            self._write_file(
+                tmpdir,
+                "test_beta.py",
+                "from beta import b\n\n"
+                "def test_b():\n"
+                "    assert b() == 2\n",
+            )
+            result = cross_check.analyze_project(
+                project_dir=tmpdir,
+                cov_target=["alpha", "beta"],
+                source_file=["alpha.py", "beta.py"],
+                test_path=["test_alpha.py", "test_beta.py"],
+                python=sys.executable,
+            )
+        files = {row["file"] for row in result["rows"]}
+        self.assertTrue(result["ok"])
+        self.assertEqual(files, {"alpha.py", "beta.py"})
+
+    def test_coverageに無いファイルでも複雑度行は返る(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_file(tmpdir, "alpha.py", "def a():\n    return 1\n")
+            self._write_file(tmpdir, "beta.py", "def b():\n    return 2\n")
+            self._write_file(
+                tmpdir,
+                "test_alpha.py",
+                "from alpha import a\n\n"
+                "def test_a():\n"
+                "    assert a() == 1\n",
+            )
+            result = cross_check.analyze_project(
+                project_dir=tmpdir,
+                cov_target=["alpha"],
+                source_file=["alpha.py", "beta.py"],
+                test_path=["test_alpha.py"],
+                python=sys.executable,
+            )
+        beta_rows = [row for row in result["rows"] if row["file"] == "beta.py"]
+        self.assertTrue(result["ok"])
+        self.assertEqual(beta_rows[0]["line_pct"], None)
+        self.assertIn("beta.py", result["error"])
+
+    def test_処理側またはテストが空なら実行せずエラーを返す(self):
+        result = cross_check.analyze_project(
+            project_dir=self._workspace(),
+            cov_target=[],
+            source_file=[],
+            test_path=[],
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("1 つ以上", result["error"])
+
+    def _write_file(self, directory: str, filename: str, content: str) -> None:
+        path = os.path.join(directory, filename)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
 
 
 if __name__ == "__main__":
