@@ -11,12 +11,14 @@
 仕組み:
 - 静的解析 (link_analyzer): 関数の抽出・複雑度・呼び出しの親子・テストの名指し。
 - 動的解析 (cross_check + coverage.py): テストを実際に実行し、行・分岐カバレッジ。
+- ファイル横断の静的コールグラフ (callgraph + pyan3): 別ファイル・別名 import を
+  解決した呼び出しグラフ。link_analyzer 自前のツリーが同一ファイル内に閉じるのを補う。
 
 使い方:
     streamlit run app.py   （workspace/ に処理側とテストの .py を置いてから選ぶ）
 注意:
     選んだテストをその場で実行するため (任意コード実行に相当), ローカル自用専用。
-依存: streamlit / pytest / pytest-cov / coverage / radon。
+依存: streamlit / pytest / pytest-cov / coverage / radon / pyan3（＋ Graphviz の dot）。
 """
 
 import html
@@ -25,6 +27,7 @@ from collections import defaultdict
 
 import streamlit as st
 
+import callgraph
 import cross_check
 import link_analyzer
 
@@ -243,6 +246,68 @@ def render_matrix(link: dict):
 
 
 # =====================================================================
+# ファイル横断の呼び出しグラフ (pyan3)
+# =====================================================================
+def render_callgraph(files: list, function: str, direction: str, depth: str):
+    """pyan3 でファイル横断の静的コールグラフを描き、SVG と text を出す."""
+    with st.spinner("pyan3 で呼び出しグラフを生成中…"):
+        result = callgraph.analyze(
+            files=files,
+            cwd=WORKSPACE_DIR,
+            function=function or None,
+            direction=direction,
+            depth=depth,
+        )
+
+    if result["error"] and not result["svg"]:
+        st.warning(result["error"])
+        if result["dot"]:
+            st.download_button(
+                "DOT をダウンロード（描画は失敗）",
+                data=result["dot"],
+                file_name="callgraph.dot",
+                mime="text/vnd.graphviz",
+            )
+        return
+
+    st.caption(
+        f"ノード {result['node_count']} 個・エッジ {result['edge_count']} 本。"
+        "矢印は「呼ぶ側 → 呼ばれる側」。色はモジュールごと。"
+    )
+    if result["warning"]:
+        st.info(result["warning"])
+
+    # SVG は横に長くなりがちなのでスクロールできる枠に入れる。
+    st.html(
+        '<div style="overflow:auto; max-height:640px; border:1px solid #e3e6ea; '
+        f'border-radius:6px; padding:8px; background:#fff">{result["svg"]}</div>'
+    )
+
+    dl1, dl2, dl3 = st.columns(3)
+    with dl1:
+        st.download_button(
+            "SVG を保存", data=result["svg"],
+            file_name="callgraph.svg", mime="image/svg+xml",
+        )
+    with dl2:
+        st.download_button(
+            "DOT を保存", data=result["dot"],
+            file_name="callgraph.dot", mime="text/vnd.graphviz",
+        )
+    with dl3:
+        if result["text"]:
+            st.download_button(
+                "階層ツリー(text)を保存", data=result["text"],
+                file_name="callgraph.txt", mime="text/plain",
+            )
+
+    if result["text"]:
+        with st.expander("階層ツリー（テキスト・AI に渡す用）"):
+            st.caption("インデントが呼び出しの親子。[U] は uses（呼び出し）の辺。")
+            st.code(result["text"])
+
+
+# =====================================================================
 # メイン
 # =====================================================================
 st.title("テスト理解ビューア")
@@ -286,6 +351,37 @@ st.caption(
     "カバレッジ対象モジュール: "
     + (", ".join(f"`{target}`" for target in cov_targets) or "未選択")
 )
+
+# --- 呼び出しグラフの設定（任意・解析実行に含める） ---
+with st.expander("ファイル横断の呼び出しグラフの設定（任意）", expanded=False):
+    st.caption(
+        "pyan3 で、別ファイル・別名 import を解決した関数どうしの呼び出しグラフを描きます"
+        "（自前ツリーが同一ファイル内に閉じるのを補う機能）。"
+    )
+    cg_include_tests = st.checkbox(
+        "テストファイルも含める（テスト → 処理側の横断を見る）", value=True
+    )
+    cg_col1, cg_col2 = st.columns(2)
+    with cg_col1:
+        cg_function = st.text_input(
+            "起点関数で絞り込む（任意）",
+            value="",
+            help="空欄＝全体。例: sample_module.analyze_source（モジュール名.関数名）。",
+        ).strip()
+        cg_direction = st.selectbox(
+            "たどる向き",
+            options=["down", "up", "both"],
+            index=0,
+            format_func=lambda d: {
+                "down": "呼ぶ先（callee）", "up": "呼び元（caller）", "both": "両方"
+            }[d],
+            help="起点関数を指定したときのみ効きます。",
+        )
+    with cg_col2:
+        cg_depth_label = st.selectbox(
+            "粒度", options=list(callgraph.DEPTH_CHOICES.keys()), index=0
+        )
+    cg_depth = callgraph.DEPTH_CHOICES[cg_depth_label]
 
 if not st.button("解析する", type="primary"):
     st.stop()
@@ -413,6 +509,22 @@ st.caption(
     "上から読むと「入口の公開関数 → その中で呼ばれるヘルパー」の順。"
     "『⚠ 一度も動いていない』の行があれば、そこがテストの穴です。"
 )
+st.caption(
+    "※ この表の親子は同一ファイル内の呼び出しです。別ファイルへの呼び出しや "
+    "`import x as y` の別名は、下の『ファイル横断の呼び出しグラフ』で解決して描きます。"
+)
+
+# --- ファイル横断の呼び出しグラフ (pyan3) ---
+st.divider()
+st.subheader("ファイル横断の呼び出しグラフ（pyan3）")
+st.caption(
+    "別ファイル・別名 import を解決した、関数どうしの静的な呼び出しグラフです。"
+    "上のツリーが同一ファイル内に閉じるのを補います。"
+    "静的解析のため、visitor の self.visit() のような動的な呼び出しは辿れません"
+    "（その経路は上の『動いた／カバー分岐%』で裏取りしてください）。"
+)
+cg_files = list(source_files) + (list(test_files) if cg_include_tests else [])
+render_callgraph(cg_files, cg_function, cg_direction, cg_depth)
 
 # --- 詳細 (見たい人だけ) ---
 with st.expander("詳細①：どのテストがどの関数を名指ししているか（マトリクス）"):

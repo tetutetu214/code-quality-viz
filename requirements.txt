@@ -9,3 +9,8 @@ pytest>=8.0
 pytest-cov>=5.0
 coverage>=7.0
 radon>=6.0
+
+# ファイル横断の呼び出しグラフで実行時に使う（callgraph.py が subprocess で呼ぶ）。
+# pyan3 が DOT を出し、Graphviz の dot コマンド（OS 依存・別途 `apt install graphviz`）
+# で SVG に描く。
+pyan3>=1.2.0
