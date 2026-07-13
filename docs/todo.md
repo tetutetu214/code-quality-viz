@@ -50,8 +50,19 @@
 - [x] 呼び出しツリーはファイルごとのセクション表示（ファイル横断ツリー統合はスコープ外）
 - [x] テスト 51→98 件パス（複数ファイルE2E含む）。実装は Codex 委譲、レビュー・E2E追加は Claude
 
+## 次フェーズ：呼び出しグラフ機能の強化（要件 = docs/requirements-callgraph.md）
+OSS調査を要件化。自前 _CallCollector の限界（ファイル横断×／動的dispatch×）を実績OSSで埋める。
+静的×動的ハイブリッドを踏襲（radon 採用時と同じ「自前を保守対象から外す」判断）。
+- [ ] フェーズ0: PoC（WSL2+3.12 で pyan3/code2flow/pydeps/gprof2dot/snakeviz を実コードで検証、採否確定、knowledge.md に記録）
+- [ ] フェーズ0: 自前 _CallCollector の撤去可否を pyan3 のファイル横断解決の実測で判断（FR-11 方針A/B）
+- [ ] フェーズ1: pyan3 でファイル横断の静的コールグラフ統合＋起点/深さ絞り込み＋画像書き出し（FR-1〜4）
+- [ ] フェーズ1: pydeps のモジュール依存図・循環import検出パネル（FR-5）
+- [ ] フェーズ2: cProfile+gprof2dot の実行経路グラフ、静的×動的の並置（FR-6, FR-8）
+- [ ] フェーズ2: snakeviz の icicle 階層ツリー導線（任意, FR-7）
+- [ ] フェーズ3: 用語凡例・限界注記・README（Graphviz導入/VS Code Call Hierarchy 運用）・requirements.txt 追記
+
 ## 次にやること（候補）
-- [ ] ファイル横断の呼び出しツリー統合（import 解決の設計が必要、次フェーズ）
+- [x] ファイル横断の呼び出しツリー統合（→ 上記フェーズ計画として要件化。docs/requirements-callgraph.md）
 - [ ] てつてつの実機フィードバック反映（ツリーの見やすさ・列の要不要）
 - [ ] workspace サンプルに「わざと穴がある版」を足し、⚠ が出る例も見せる
 - [ ] 呼び出しツリーの限界メモ（visitorパターン等の動的dispatchは静的に辿れない）
