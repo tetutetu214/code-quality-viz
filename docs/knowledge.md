@@ -14,6 +14,35 @@
 
 ## 決定事項
 
+### 2026-07-13 呼び出しグラフ強化 PoC フェーズ0 の実測結果（要件 docs/requirements-callgraph.md）
+PoC環境: クラウドコンテナ Python 3.11 + Graphviz 2.42（実ターゲットは WSL2+3.12。ツールは
+バージョン許容度が高く pyan3 は 3.10〜3.14 テスト済みのため、本結果は概ね転用可能と判断。
+3.12実機での最終確認は残タスク）。導入版: pyan3 2.6.1 / code2flow 2.5.1 / pydeps 3.0.6 /
+gprof2dot 2025.4.14。検証対象は `workspace/`（test_sample_module.py が
+`import sample_module as link_analyzer` の別名importで sample_module.py を呼ぶ＝C1/C3の実例）。
+
+- **C1（ファイル横断）解消を実測確認**: pyan3 が `test_...__test_simple_function_metrics`
+  → `sample_module__analyze_source` のようにテストファイル→処理ファイルの横断エッジを張れた。
+  自前 `_CallCollector`（同ファイル内のみ）が原理的にできない部分。
+- **C3（別名import）解消を実測確認**: `link_analyzer.analyze_source()` の呼び出しを、別名
+  `link_analyzer`→実体 `sample_module` へ解決して正しいノードに接続した。
+- **C2（動的dispatch）は残存**: visitor の `self.visit()`→`visit_Call` は pyan3 でも辿れず、
+  該当メソッドは親を持たない。全静的ツール共通の原理限界で、動的（cProfile）裏取りが必要
+  という要件の前提が正しいことを再確認。
+- **FR-2（絞り込み）有効**: code2flow `--target-function analyze_source --downstream-depth 2`
+  で全体57KB→7KBに縮小。大規模時の判読性対策として機能する。
+- **FR-4（text出力）有効**: pyan3 `--text` はインデントの階層ツリー（`[U]`=uses）を出力。
+  AIエージェント供給用途に加え、ユーザーが元々求めた「xxx └yyy 型の階層ツリー」に最も近い。
+- **pydeps**: 単一ファイルでは出力が極小（606B）で、モジュール粒度ツールである性質を再確認。
+  実際の多モジュールpkgで初めて有用。関数コールグラフとはパネルを分ける方針を維持。
+- **Graphviz描画**: SVG/PNG とも問題なく生成（要 `apt install graphviz`）。
+
+**FR-11（自前 _CallCollector 撤去可否）の結論 → 方針A採用を推奨**:
+pyan3 は現実ケースで自前静的エッジの上位互換（横断・別名を解決し、C2の未解決は両者共通で
+回帰なし）。よって静的コールグラフ生成は pyan3 に一本化し、自前 `_CallCollector`/`_compute_calls`
+は撤去または「簡易版」として詳細送りにする（radon 導入時と同じ「自前を保守対象から外す」判断）。
+残課題: 3.12実機確認、pyan3再開直後ゆえ大規模実コードでの安定性・実行時間の確認。
+
 ### 2026-07-06 複数ファイル解析対応の設計
 - カバレッジは pytest **1回の実行**に `--cov=<module>` を複数指定して取る（間接カバレッジの取りこぼし防止）。coverage.json はファイル別なので行に由来ファイル（`row["file"]`）を付けて集計。
 - 関数・テストクラスの表示名は**衝突したときだけ**リネーム（`ファイル名.関数名` / `test_file.py::Class`）。1ファイル選択時は従来表示を完全維持（後方互換）。
