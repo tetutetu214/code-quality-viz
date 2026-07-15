@@ -53,8 +53,10 @@
 ## 次フェーズ：呼び出しグラフ機能の強化（要件 = docs/requirements-callgraph.md）
 OSS調査を要件化。自前 _CallCollector の限界（ファイル横断×／動的dispatch×）を実績OSSで埋める。
 静的×動的ハイブリッドを踏襲（radon 採用時と同じ「自前を保守対象から外す」判断）。
-- [ ] フェーズ0: PoC（WSL2+3.12 で pyan3/code2flow/pydeps/gprof2dot/snakeviz を実コードで検証、採否確定、knowledge.md に記録）
-- [ ] フェーズ0: 自前 _CallCollector の撤去可否を pyan3 のファイル横断解決の実測で判断（FR-11 方針A/B）
+- [x] フェーズ0: PoC（Python 3.11+Graphviz で pyan3/code2flow/pydeps/gprof2dot/snakeviz を実コードで検証、採否確定、knowledge.md に記録 2026-07-15）
+  - 横断/同名/動的dispatch を仕込んだ3ファイルfixtureで5ツール＋自前を実走比較。全ツール Python 3.11 で動作確認（code2flow は `--use-pep517` 必須）。
+  - 実測: pyan3 が C1(横断) を解消し C3(同名) も symtable で正しく解決。動的(cProfile+gprof2dot)のみ C2(動的dispatch `visit→visit_Call`) を捕捉 → FR-8 の静的×動的補完を実データで裏付け。
+- [x] フェーズ0: 自前 _CallCollector の撤去可否を pyan3 のファイル横断解決の実測で判断 → **FR-11 方針A採用**（静的は pyan3 に一本化。ただし既存インデントツリーUIは pyan3 のエッジから組み直して維持＝両取りをフェーズ1第一候補に）
 - [ ] フェーズ1: pyan3 でファイル横断の静的コールグラフ統合＋起点/深さ絞り込み＋画像書き出し（FR-1〜4）
 - [ ] フェーズ1: pydeps のモジュール依存図・循環import検出パネル（FR-5）
 - [ ] フェーズ2: cProfile+gprof2dot の実行経路グラフ、静的×動的の並置（FR-6, FR-8）

@@ -52,3 +52,28 @@
 - **対応**: (1) link_analyzer に呼び出し関係抽出を追加（`_CallCollector` が関数本体の Call を走査、入れ子関数には潜らない。`_compute_calls` が素の名前を一意に解決して辺を張る）。(2) app.py を「全関数を親子でインデントした1枚のツリー表」に作り替え。列＝種類/複雑さ/担当テスト/動いた/カバー分岐%/状態。(3) 用語凡例を常設し造語を廃止。(4) 先頭に平文の「ひとことまとめ」。(5) マトリクス等は詳細expanderへ。
 - **静的呼び出しグラフの限界（正直に）**: visitor パターンの `self.visit()`/`generic_visit()` のような動的 dispatch は静的に辿れないので、その経路のメソッドは親を持たず入口（根）として並ぶ。主要な公開関数→ヘルパーの鎖は辿れる。
 - **教訓（メモリ化済み）**: 素人ユーザーには設計の二択を投げず、良い形をこちらで決めて作って見せる。用語は出すたびその場で定義し、造語なら「これは自分の言い方」と明示する。
+
+### 2026-07-15 呼び出しグラフOSSツール PoC（フェーズ0）を実測 → pyan3 採用（FR-11 方針A）
+要件 `docs/requirements-callgraph.md` のフェーズ0を実施。ファイル横断呼び出し(C1)・同名関数(C3)・動的dispatch(C2)を意図的に仕込んだ3ファイルのフィクスチャ（`app_main.run → storage.build_key → util_str.shout → normalize`、`normalize` は storage/util_str に同名別実装、`_Counter(ast.NodeVisitor)` で `visit → visit_Call` の動的dispatch）を作り、5ツール＋自前 `_CallCollector` を実走させて突き合わせた。環境は Python 3.11 + Graphviz 2.43。
+
+- **一次結論: pyan3 は自前 `_CallCollector` を機能面で上回る（C1 を解消、C3 も正しく解決）**。実測エッジの比較：
+  | エッジ | 種類 | 自前 `_CallCollector` | pyan3 | 動的(cProfile+gprof2dot) |
+  |---|---|---|---|---|
+  | `run → build_key` | C1 横断 | ❌ 欠落 | ✅ | ✅ |
+  | `build_key → shout` | C1 横断 | ❌ 欠落 | ✅ | ✅ |
+  | `build_key → normalize` | C3 同名 | ✅ storage版 | ✅ storage版 | ✅ storage版 |
+  | `shout → normalize` | C3 同名 | ✅ util_str版 | ✅ util_str版 | ✅ util_str版 |
+  | `visit → visit_Call` | C2 動的dispatch | ❌ | ❌（原理的に不可） | ✅（2×, 実行で捕捉） |
+- **自前 `_CallCollector` はファイル横断(C1)を全て取りこぼすことが実測で確定**。`_compute_calls` はファイル単位で辺を張るため、`run → build_key`・`build_key → shout` のような別ファイル呼び出しが一切出ない（自前ツリーで `run` も `build_key` の子として `shout` も出ない）。C3（同名 `normalize`）は自前でも解決できたが、これは「2つの `normalize` がたまたま別ファイルで、ファイル単位に見ると各ファイル内で一意」だったため。**同一ファイル内に同名関数が2つある場合は `len(targets)==1` 条件で自前は保留（辺を張らない）に落ちる**のに対し、pyan3 は symtable のスコープ解決で正しく区別する（DOT の namespace 付きID `storage__normalize` / `util_str__normalize` で確認）。
+- **C2（動的dispatch）は静的3ツール全滅、動的だけが捕捉**。visitorパターンの `NodeVisitor.visit` は `getattr(self, 'visit_'+type)` で分岐するため、pyan3・code2flow・自前のいずれも `visit → visit_Call` を静的に辿れない（＝要件 R-1 の通り原理的限界）。cProfile+gprof2dot は実行して `ast:414:visit → app_main:19:visit_Call`（呼び出し2回）を回数付きで捕捉。→ **静的で構造・動的で裏取り（FR-8）は実データで裏付けられた**。
+- **各ツールの動作確認（Python 3.11 で全て可）**:
+  - **pyan3**: `python -m pyan *.py --uses --defines`。`--text`（AIエージェント供給用、短縮名で表示）／`--dot`（namespace付きID、同名区別はこちらで確認可）／`--svg`/`--html`。C1・C3 の主役として採用。
+  - **code2flow**: `code2flow *.py -o out.svg`、`--target-function run --downstream-depth N` で局所展開。**pip インストールは `--use-pep517` が必須**（素の `pip install code2flow` は setuptools の `install_layout` 廃止でwheelビルド失敗）。静的の副（全体一枚絵）として採用。
+  - **pydeps**: `pydeps app_main.py --show-dot --no-show`。`util_str → storage → app_main` のモジュール依存を正しく検出。**関数ではなくモジュール粒度**（役割を混同しない）。
+  - **gprof2dot**: `python -m gprof2dot -f pstats run.pstats`。**デフォルトは `--node-thres=0.5 --edge-thres=0.1` で軽い関数が刈られる**ので、小さい対象では `--node-thres=0 --edge-thres=0` を付けないと自作関数が消える（PoCで踏んだ）。ラベルは `module:lineno:funcname\n%\n(self%)\nN×` 形式。
+  - **snakeviz**: インストール・import・pstats入力を確認。ブラウザ(icicle)起動系のためヘッドレスCIでの全経路検証は不可、導線のみ確認（NFR-4: URL手動オープン想定と整合）。
+- **決定（FR-11 = 方針A採用）**: 静的コールグラフは **pyan3 に一本化**する（radon 導入と同じ「自前解析を保守対象から外す」判断）。自前 `_CallCollector`/`_compute_calls` は撤去または「簡易版」として詳細へ格納。
+  - **ただし既存UI（インデント1枚ツリー）を捨てる必要はない**: pyan3 の DOT エッジ（namespace付きID）を読んで**同じインデントツリーを pyan3 のエッジから組み直せば**、C1（横断）と C3（同名）を直したまま「見慣れたツリー表」を維持できる（両取り）。フェーズ1の実装方針としてこれを第一候補にする。
+  - リスク（要件 R-3）: pyan3 は2026年に開発再開直後。PoCの範囲（3.11・小規模）では安定動作を確認したが、大規模・別名import多用での安定性はフェーズ1で実コード（`link_analyzer.py` 自身など）に対して継続確認する。
+- **前提**: Graphviz(`dot`) が全静的ツールで必須（`apt install graphviz`）。未導入時は落とさず導入手順を画面表示する（AC-5）。追加依存 `pyan3`/`code2flow`/`pydeps`/`gprof2dot`/`snakeviz` は実装フェーズで `requirements.txt` に追記予定（PoC段階ではまだ追記しない）。
+- **PoCフィクスチャはスクラッチ限定でリポジトリ未コミット**（`workspace/` にわざと穴のある横断サンプルを足すのは todo の別項として実装フェーズで対応）。
