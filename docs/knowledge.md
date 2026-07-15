@@ -77,3 +77,15 @@
   - リスク（要件 R-3）: pyan3 は2026年に開発再開直後。PoCの範囲（3.11・小規模）では安定動作を確認したが、大規模・別名import多用での安定性はフェーズ1で実コード（`link_analyzer.py` 自身など）に対して継続確認する。
 - **前提**: Graphviz(`dot`) が全静的ツールで必須（`apt install graphviz`）。未導入時は落とさず導入手順を画面表示する（AC-5）。追加依存 `pyan3`/`code2flow`/`pydeps`/`gprof2dot`/`snakeviz` は実装フェーズで `requirements.txt` に追記予定（PoC段階ではまだ追記しない）。
 - **PoCフィクスチャはスクラッチ限定でリポジトリ未コミット**（`workspace/` にわざと穴のある横断サンプルを足すのは todo の別項として実装フェーズで対応）。
+
+### 2026-07-15 フェーズ1: ファイル横断コールグラフを pyan3 で実装（FR-1〜4）
+PoCの方針A（静的は pyan3 へ委譲）を実装。新モジュール `callgraph.py` を追加し、app.py にパネルを統合。全117件パス（98→+19: callgraph単体17＋app AppTest2）。
+
+- **pyan3 の DOT を「呼び出し辺」に変換する規則（実装の核）**: `python -m pyan <files> --uses --dot` の出力で、**`style="solid"` かつ両端が非モジュールノード**の辺だけが関数間の呼び出し。`dashed` は defines（モジュール→メンバ, クラス→メソッド）なので捨てる。モジュールノードは tooltip が2行（`name\npath`）で `:line` も `in` も無いことで判別（関数/メソッド/クラスは `qname\npath:line\nkind in scope`）。同名関数は pyan の namespace 付きノードID（`storage__normalize` / `util_str__normalize`）と tooltip の qname で区別できる（C3 解決）。
+- **既存インデントツリーUIを捨てずに横断対応**: `build_order` を link_analyzer/app.build_tree_order と同じ意味論（入次数0を根・公開優先・DFS・重複畳み・孤立は末尾）で実装し、pyan のエッジから同じ形のツリーを組み直した。表示名は qname（`module.関数`）にして同名を区別。→ 「見慣れたツリー」を保ったまま C1（横断）と C3（同名）が直る両取り。
+- **純粋関数と subprocess を分離してテスト可能に**: `parse_pyan_dot` / `build_order` / `build_subgraph_dot` は缶詰DOTで単体テスト（pyan非依存）。subprocess ラッパ（`generate_dot` / `render_svg` / `generate_text`）はツール未導入を monkeypatch で検証（NFR-9）。pyan 実走の統合テストは `@skipUnless(pyan_available())` でガード。
+- **図の表示と保存で必要物が違う**: 表示は `st.graphviz_chart(dot)`（ブラウザ内 viz.js 描画なので**ローカル Graphviz 不要**）、SVG保存は `dot -Tsvg`（**ローカル Graphviz 必要**）。この非対称を利用し、Graphviz 未導入でも図は出す／保存ボタンだけ導入手順に差し替える設計。ツール未導入は一切 raise せず `analyze()` が `ok=False`+`hint` を返す（AC-5）。
+- **絞り込みは pyan フラグでなく自前で**: pyan の `--depth` は名前空間のネスト深さで、呼び出し連鎖の深さではない。起点＋連鎖深さの絞り込みは `build_order(start=, max_depth=)` で自前実装した方が正確でテストしやすい（FR-2）。大規模（>60関数）は全体図を抑止して起点指定を促す（NFR-6）。
+- **C2（動的dispatch）は静的では出せないまま**: `visit→visit_Call` 等は pyan でも辿れず入口として並ぶ。画面キャプションで明記し「実際に通ったかは上のカバレッジで裏取り」と誘導（フェーズ2で cProfile 側を並置予定）。
+- **`use_container_width` は非推奨**（streamlit 1.59系）。`width="stretch"` を使う（st.graphviz_chart も width 対応済み）。
+- **既存テストの回帰に注意**: 横断ツリー表を足したことで AppTest の「全dataframe走査」が別列の表で KeyError を起こした。`"関数" in df.columns` で対象表を絞って修正（新パネルは列名が異なる）。

@@ -9,3 +9,9 @@ pytest>=8.0
 pytest-cov>=5.0
 coverage>=7.0
 radon>=6.0
+
+# ファイル横断の静的コールグラフ（callgraph.py が subprocess で `python -m pyan` を呼ぶ）。
+# 別ファイルへの呼び出し・同名関数をスコープ解決で辿る。図の書き出し（SVG）には別途
+# OS の Graphviz が必要（`sudo apt install graphviz` / `brew install graphviz`）。
+# ブラウザ上の図表示（st.graphviz_chart）だけなら Graphviz の導入は不要。
+pyan3>=1.2.0

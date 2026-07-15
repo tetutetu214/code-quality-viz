@@ -25,6 +25,7 @@ from collections import defaultdict
 
 import streamlit as st
 
+import callgraph
 import cross_check
 import link_analyzer
 
@@ -242,6 +243,107 @@ def render_matrix(link: dict):
     st.caption("● 直接呼び出し(C)／○ self 代入経由(B)／薄赤の行=名指しなし／薄橙の列=どの関数にも紐づかないテスト")
 
 
+def render_callgraph_panel(source_files: list):
+    """ファイル横断の静的コールグラフを pyan3 で生成して見せる（フェーズ1 / FR-1〜4）.
+
+    上の「全関数ツリー」はファイル単位（別ファイルへの呼び出しは出ない）。ここでは
+    pyan3 が別ファイルへの呼び出しまで解決した 1 枚のツリー＋図を出す。ツールが未導入
+    でも例外を出さず、導入手順を案内する（AC-5）。
+    """
+    if not callgraph.pyan_available():
+        st.info(
+            "ファイル横断のコールグラフには pyan3 が必要です。"
+            "`pip install pyan3` で導入すると、別ファイルへの呼び出しまで 1 枚に統合できます。"
+        )
+        return
+
+    paths = [os.path.join(WORKSPACE_DIR, name) for name in source_files]
+    result = callgraph.analyze(paths)
+    if not result["ok"]:
+        st.warning(result["error"] or "コールグラフを生成できませんでした。")
+        if result.get("hint"):
+            st.caption(result["hint"])
+        return
+
+    nodes = result["nodes"]
+    st.caption(
+        "pyan3（静的解析）で、選んだ全ファイルを横断して「誰が誰を呼ぶか」を解決したツリーです。"
+        "上の『全関数ツリー』が取りこぼす**別ファイルへの呼び出し**もここでは 1 本につながります。"
+        "※ visitor の `self.visit()` のような動的な呼び出しは静的に辿れないため、"
+        "その経路は根（入口）として並びます。実際に通ったかは上のカバレッジで裏取りしてください。"
+    )
+
+    # --- 絞り込み（起点＋深さ）: FR-2 ---
+    entry_map = {"（全体）": None}
+    for nid in result["entry_ids"]:
+        entry_map[nodes[nid]["qname"]] = nid
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        choice = st.selectbox(
+            "起点の関数（大きいコードはここで絞ると読みやすい）",
+            list(entry_map.keys()),
+            key="cg_start",
+        )
+    with col2:
+        depth = st.slider("たどる深さ", 1, 8, 4, key="cg_depth")
+    start = entry_map[choice]
+
+    order = callgraph.build_order(nodes, result["call_edges"], start=start, max_depth=depth)
+    selected_ids = [nid for nid, _ in order]
+
+    # --- 横断ツリー表 ---
+    table = []
+    for nid, d in order:
+        n = nodes[nid]
+        indent = "　" * d + ("└ " if d else "")
+        table.append(
+            {
+                "関数（module.名前）": indent + n["qname"],
+                "種類": "公開" if not n["short"].split(".")[-1].startswith("_") else "ヘルパー",
+                "定義元": os.path.basename(n["file"]) if n["file"] else "—",
+            }
+        )
+    st.dataframe(table, width="stretch", hide_index=True)
+
+    # --- 図（ブラウザ描画。大規模なら起点指定を促す: NFR-6）---
+    dot = callgraph.build_subgraph_dot(nodes, result["call_edges"], selected_ids)
+    if start is None and result["too_large"]:
+        st.info(
+            f"関数が {result['n_nodes']} 個と多いため、全体図は省略しました。"
+            "上の『起点の関数』を選ぶと、その周りだけの図を表示します。"
+        )
+    else:
+        st.graphviz_chart(dot, width="stretch")
+        if callgraph.graphviz_available():
+            try:
+                svg = callgraph.render_svg(dot)
+                st.download_button(
+                    "この図を SVG で保存",
+                    data=svg,
+                    file_name="callgraph.svg",
+                    mime="image/svg+xml",
+                )
+            except callgraph.CallgraphError:
+                pass
+        else:
+            st.caption(
+                "SVG 保存には Graphviz が必要です（`sudo apt install graphviz`）。図の表示は不要です。"
+            )
+
+    # --- C1 が解けた証拠: 別ファイルへの呼び出し一覧 ---
+    cross = result["cross_file_edges"]
+    if cross:
+        with st.expander(f"別ファイルへの呼び出し {len(cross)} 本（自前ツリーでは出なかった関係）"):
+            for s, d in cross:
+                st.markdown(f"- `{nodes[s]['qname']}` → `{nodes[d]['qname']}`")
+
+    # --- pyan text 出力（別の AI に貼れる）: FR-4 ---
+    text = callgraph.generate_text(paths)
+    if text:
+        with st.expander("詳細：pyan3 のテキスト出力（別の AI エージェントにそのまま渡せます）"):
+            st.code(text)
+
+
 # =====================================================================
 # メイン
 # =====================================================================
@@ -413,6 +515,11 @@ st.caption(
     "上から読むと「入口の公開関数 → その中で呼ばれるヘルパー」の順。"
     "『⚠ 一度も動いていない』の行があれば、そこがテストの穴です。"
 )
+
+# --- ファイル横断コールグラフ (pyan3) ---
+st.divider()
+st.subheader("ファイル横断コールグラフ（別ファイルへの呼び出しも 1 枚に）")
+render_callgraph_panel(source_files)
 
 # --- 詳細 (見たい人だけ) ---
 with st.expander("詳細①：どのテストがどの関数を名指ししているか（マトリクス）"):
