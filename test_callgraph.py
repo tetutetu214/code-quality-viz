@@ -212,5 +212,129 @@ class TestIntegrationWithPyan(unittest.TestCase):
         self.assertIn(("util_str.shout", "util_str.normalize"), edges)
 
 
+# gprof2dot の `-f pstats --node-thres=0 --edge-thres=0` 出力を模した缶詰（実測フォーマット）。
+# source = storage / app_main、external = ast。storage:20:<genexpr> は内包表記の疑似関数。
+SAMPLE_G2D_DOT = r'''digraph {
+    1 [color="#0d2379", label="storage:11:build_key\n8.55%\n(1.24%)\n1×"];
+    2 [color="#0d2379", label="storage:6:normalize\n4.06%\n(3.62%)\n1×"];
+    3 [color="#0d2379", label="ast:414:visit\n43.49%\n(12.38%)\n11×"];
+    4 [color="#0d2379", label="app_main:19:visit_Call\n24.06%\n(0.86%)\n2×"];
+    5 [color="#0d2379", label="storage:20:<genexpr>\n1.00%\n(1.00%)\n3×"];
+    1 -> 2 [label="4.06%\n1×"];
+    3 -> 4 [label="24.06%\n2×"];
+    1 -> 5 [label="1.00%\n3×"];
+}
+'''
+
+
+class TestParseGprof2dot(unittest.TestCase):
+    """動的（gprof2dot）DOT の解析: source 判定・dispatch 辺・内包表記除外."""
+
+    def setUp(self):
+        self.nodes, self.edges = cg.parse_gprof2dot(
+            SAMPLE_G2D_DOT, {"storage", "app_main"}
+        )
+
+    def test_in_source_flag(self):
+        ids = {self.nodes[i]["qname"]: self.nodes[i] for i in self.nodes}
+        self.assertTrue(ids["storage.build_key"]["in_source"])
+        self.assertTrue(ids["app_main.visit_Call"]["in_source"])
+        self.assertFalse(ids["ast.visit"]["in_source"])  # external
+
+    def test_calls_and_line_parsed(self):
+        n = next(v for v in self.nodes.values() if v["qname"] == "storage.build_key")
+        self.assertEqual(n["line"], 11)
+        self.assertEqual(n["calls"], "1")
+
+    def test_edges_keep_source_callee_and_dispatch(self):
+        pairs = {(self.nodes[s]["qname"], self.nodes[d]["qname"]) for s, d in self.edges}
+        self.assertIn(("storage.build_key", "storage.normalize"), pairs)  # source->source
+        self.assertIn(("ast.visit", "app_main.visit_Call"), pairs)        # 外部->source(dispatch)
+
+    def test_comprehension_edge_dropped(self):
+        pairs = {(self.nodes[s]["qname"], self.nodes[d]["qname"]) for s, d in self.edges}
+        self.assertNotIn(("storage.build_key", "storage.<genexpr>"), pairs)
+
+
+class TestBuildDynamicDot(unittest.TestCase):
+    def test_external_node_lighter_and_edges_present(self):
+        nodes, edges = cg.parse_gprof2dot(SAMPLE_G2D_DOT, {"storage", "app_main"})
+        dot = cg.build_dynamic_dot(nodes, edges)
+        self.assertTrue(dot.strip().startswith("digraph"))
+        self.assertIn("ast.visit", dot)
+        self.assertIn("app_main.visit_Call", dot)
+        # 外部ノードは淡色（#f0f0f0）、source は濃色（#e9f6ec）。
+        self.assertIn("#f0f0f0", dot)
+        self.assertIn("#e9f6ec", dot)
+
+
+class TestCompareStaticDynamic(unittest.TestCase):
+    """静的×動的の突き合わせ（(module, func, line) キー）."""
+
+    def _static(self):
+        # build_key(11) -> normalize(6) と build_key(11) -> helper(30) の 2 辺。
+        nodes = {
+            "a": {"file": "/w/storage.py", "short": "build_key", "line": 11, "qname": "storage.build_key"},
+            "b": {"file": "/w/storage.py", "short": "normalize", "line": 6, "qname": "storage.normalize"},
+            "c": {"file": "/w/storage.py", "short": "helper", "line": 30, "qname": "storage.helper"},
+        }
+        return {"nodes": nodes, "call_edges": [("a", "b"), ("a", "c")], "n_nodes": 3}
+
+    def _dynamic(self):
+        # 実行で通ったのは build_key -> normalize のみ。build_key -> extra(99) は静的に無い。
+        nodes = {
+            "1": {"module": "storage", "func": "build_key", "line": 11, "qname": "storage.build_key", "in_source": True},
+            "2": {"module": "storage", "func": "normalize", "line": 6, "qname": "storage.normalize", "in_source": True},
+            "9": {"module": "storage", "func": "extra", "line": 99, "qname": "storage.extra", "in_source": True},
+        }
+        return {"nodes": nodes, "edges": [("1", "2"), ("1", "9")]}
+
+    def test_buckets(self):
+        cmp = cg.compare_static_dynamic(self._static(), self._dynamic())
+        self.assertEqual(cmp["both_count"], 1)  # build_key->normalize
+        self.assertIn(("storage.build_key", "storage.helper"), cmp["only_static"])
+        self.assertIn(("storage.build_key", "storage.extra"), cmp["only_dynamic"])
+
+
+class TestDynamicFallback(unittest.TestCase):
+    def test_analyze_dynamic_without_gprof2dot(self):
+        orig = cg.gprof2dot_available
+        cg.gprof2dot_available = lambda: False
+        try:
+            r = cg.analyze_dynamic(["test_x.py"], "/w", ["x.py"])
+        finally:
+            cg.gprof2dot_available = orig
+        self.assertFalse(r["ok"])
+        self.assertIn("gprof2dot", r["hint"])
+
+    def test_analyze_dynamic_no_tests(self):
+        r = cg.analyze_dynamic([], "/w", ["x.py"])
+        self.assertFalse(r["ok"])
+
+
+@unittest.skipUnless(cg.gprof2dot_available(), "gprof2dot 未導入のため統合テストをスキップ")
+class TestDynamicIntegration(unittest.TestCase):
+    """cProfile+gprof2dot を実際に走らせ、実行された関数と dispatch 辺が出る（FR-6）."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        with open(os.path.join(self.tmp, "mod.py"), "w") as f:
+            f.write(
+                "def helper(x):\n    return x + 1\n\n"
+                "def entry(x):\n    return helper(x) * 2\n"
+            )
+        with open(os.path.join(self.tmp, "test_mod.py"), "w") as f:
+            f.write(
+                "from mod import entry\n\n"
+                "def test_entry():\n    assert entry(2) == 6\n"
+            )
+
+    def test_executed_and_source_edge(self):
+        r = cg.analyze_dynamic(["test_mod.py"], self.tmp, ["mod.py"])
+        self.assertTrue(r["ok"], msg=r.get("hint"))
+        self.assertGreaterEqual(r["n_executed"], 2)  # entry と helper が動いた
+        self.assertIn(("mod.entry", "mod.helper"), r["source_edges"])
+
+
 if __name__ == "__main__":
     unittest.main()

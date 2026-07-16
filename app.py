@@ -243,7 +243,7 @@ def render_matrix(link: dict):
     st.caption("● 直接呼び出し(C)／○ self 代入経由(B)／薄赤の行=名指しなし／薄橙の列=どの関数にも紐づかないテスト")
 
 
-def render_callgraph_panel(source_files: list):
+def render_callgraph_panel(source_files: list, test_files: list):
     """ファイル横断の静的コールグラフを pyan3 で生成して見せる（フェーズ1 / FR-1〜4）.
 
     上の「全関数ツリー」はファイル単位（別ファイルへの呼び出しは出ない）。ここでは
@@ -343,6 +343,91 @@ def render_callgraph_panel(source_files: list):
         with st.expander("詳細：pyan3 のテキスト出力（別の AI エージェントにそのまま渡せます）"):
             st.code(text)
 
+    # --- 動的（実行経路）での裏取り: FR-6 / FR-8 ---
+    st.markdown("#### 実行経路（動的）で裏取りする")
+    st.caption(
+        "上の静的グラフは「呼びうるか」。ここではテストを **cProfile 下でもう一度実行**して"
+        "「今回、実際にどの関数がどこから呼ばれたか」を記録し、静的グラフと突き合わせます。"
+        "visitor の `self.visit()` のように静的では辿れない経路（＝入口として並ぶ関数）が、"
+        "実行では誰から呼ばれたのかを裏取りできます。"
+    )
+    _render_dynamic_subpanel(test_files, source_files, result)
+
+
+def _render_dynamic_subpanel(test_files: list, source_files: list, static_result: dict):
+    if not callgraph.gprof2dot_available():
+        st.info("実行経路の裏取りには gprof2dot が必要です（`pip install gprof2dot`）。")
+        return
+    if not st.checkbox(
+        "テストをもう一度 cProfile 下で実行して裏取りする（時間がかかります）",
+        key="cg_dynamic",
+    ):
+        return
+
+    with st.spinner("cProfile 下でテストを実行して実行経路を記録中…"):
+        dyn = callgraph.analyze_dynamic(test_files, WORKSPACE_DIR, source_files)
+    if not dyn["ok"]:
+        st.warning(dyn["error"] or "実行経路を取得できませんでした。")
+        if dyn.get("hint"):
+            st.caption(dyn["hint"])
+        return
+
+    cmp = callgraph.compare_static_dynamic(static_result, dyn)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("実行された関数", dyn["n_executed"])
+    c2.metric("静的で検出した関数", static_result["n_nodes"])
+    c3.metric("静的=動的で一致した呼び出し", cmp["both_count"])
+
+    # 実行経路グラフ（外部の dispatch 元は淡色ノード）。
+    if dyn["edges"]:
+        st.graphviz_chart(dyn["dot"], width="stretch")
+        st.caption("濃い箱＝解析対象の関数／淡い箱＝外部（stdlib 等, 呼び出し元）。辺の数字＝呼ばれた回数。")
+
+    # C2 の証拠: 静的では辿れず、実行では外部（dispatch 元）から呼ばれた関数。
+    if dyn["dispatch_edges"]:
+        with st.expander(
+            f"実行では別経路（動的 dispatch）で呼ばれた関数 {len(dyn['dispatch_edges'])} 件"
+            "（静的グラフでは入口として並ぶ）"
+        ):
+            st.caption(
+                "例: `ast.visit → ...visit_Xxx` は、visitor が `getattr` で動的に振り分けて呼んだ経路。"
+                "静的解析では原理的に辿れないため、実行して初めて『誰から呼ばれたか』が分かります。"
+            )
+            for a, b in dyn["dispatch_edges"]:
+                st.markdown(f"- `{a}` → `{b}`")
+
+    # テストの穴の候補: 静的にあるが今回の実行では通らなかった呼び出し。
+    if cmp["only_static"]:
+        with st.expander(
+            f"静的にはあるが今回のテストで通らなかった呼び出し {len(cmp['only_static'])} 件"
+        ):
+            st.caption(
+                "テストが未到達（穴）か、実行時は別経路（上の動的 dispatch など）で解決された関係です。"
+            )
+            for a, b in cmp["only_static"]:
+                st.markdown(f"- `{a}` → `{b}`")
+
+    # 実行で通ったが静的グラフに出ていない source→source 呼び出し。
+    if cmp["only_dynamic"]:
+        with st.expander(
+            f"実行で通ったが静的グラフに出ていない呼び出し {len(cmp['only_dynamic'])} 件"
+        ):
+            for a, b in cmp["only_dynamic"]:
+                st.markdown(f"- `{a}` → `{b}`")
+
+    # snakeviz 導線（任意, FR-7）: 起動はせず、つらら図を見るコマンドだけ案内。
+    with st.expander("さらに: 実行時間の階層ツリー（snakeviz）を見るには"):
+        st.markdown(
+            "呼び出しスタックを icicle（つらら）図で見たいときは、ターミナルで以下を実行します"
+            "（ブラウザが自動で開かない環境では表示された URL を手で開いてください）:"
+        )
+        st.code(
+            "python -m cProfile -o profile.pstats -m pytest "
+            + " ".join(test_files)
+            + "\npython -m snakeviz profile.pstats",
+            language="bash",
+        )
+
 
 # =====================================================================
 # メイン
@@ -389,7 +474,11 @@ st.caption(
     + (", ".join(f"`{target}`" for target in cov_targets) or "未選択")
 )
 
-if not st.button("解析する", type="primary"):
+# ボタンは一度きり True になる one-shot。以降のウィジェット操作（動的裏取りの
+# チェックなど）で再実行されても解析結果を保つため、session_state にラッチする。
+if st.button("解析する", type="primary"):
+    st.session_state["analyzed"] = True
+if not st.session_state.get("analyzed"):
     st.stop()
 
 if not source_files:
@@ -519,7 +608,7 @@ st.caption(
 # --- ファイル横断コールグラフ (pyan3) ---
 st.divider()
 st.subheader("ファイル横断コールグラフ（別ファイルへの呼び出しも 1 枚に）")
-render_callgraph_panel(source_files)
+render_callgraph_panel(source_files, test_files)
 
 # --- 詳細 (見たい人だけ) ---
 with st.expander("詳細①：どのテストがどの関数を名指ししているか（マトリクス）"):

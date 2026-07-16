@@ -59,6 +59,24 @@ def test_pyan導入時は起点セレクタと横断ツリー表が出る():
     assert any(s.key == "cg_depth" for s in at.slider)
 
 
+@pytest.mark.skipif(
+    not (callgraph.pyan_available() and callgraph.gprof2dot_available()),
+    reason="pyan3 または gprof2dot 未導入",
+)
+def test_動的裏取りのチェックで実行経路の突き合わせが例外なく出る():
+    at = AppTest.from_file("app.py").run(timeout=30)
+    at.button[0].click().run(timeout=120)
+    assert not at.exception
+    # 動的裏取りのチェックボックスをONにして再実行（cProfile 下でテスト実行）。
+    box = next((c for c in at.checkbox if c.key == "cg_dynamic"), None)
+    assert box is not None
+    box.check().run(timeout=180)
+    assert not at.exception
+    # 突き合わせのメトリクス（実行された関数など）が出る。
+    labels = [m.label for m in at.metric]
+    assert "実行された関数" in labels
+
+
 def test_処理側が複数ファイルでもファイルごとのツリー表が出る():
     # workspace/ には常設の処理側が 1 ファイルしかないため、2 ファイル目を
     # 一時的に足して複数ファイル経路（統合解析＋ファイル別セクション）を通す。

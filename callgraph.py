@@ -370,3 +370,262 @@ def analyze(files: list, start: str = None, max_depth: int = None, python_exe: s
         "too_large": len(func_nodes) > MAX_NODES_FOR_FULL_GRAPH,
         "raw_dot": dot,
     }
+
+
+# =====================================================================
+# 動的コールグラフ（実行経路の裏取り）— cProfile + gprof2dot（FR-6 / FR-8）
+# =====================================================================
+# 静的グラフは「呼びうるか」、動的グラフは「今回のテストで実際に呼ばれたか」。
+# 静的が取りこぼす動的 dispatch（visitor の self.visit() 等 = C2）は、実行して初めて
+# 経路が出る。両者を突き合わせて「静的にあるが通らなかった／通ったが静的に無い」を見せる。
+
+
+def gprof2dot_available() -> bool:
+    """gprof2dot が import 可能か（pstats→DOT 変換に使う）。"""
+    import importlib.util
+
+    return importlib.util.find_spec("gprof2dot") is not None
+
+
+def _stem(path: str) -> str:
+    """ファイルパス→拡張子なしの basename（＝gprof2dot のモジュール名と一致）。"""
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+# gprof2dot のノードラベル: `module:lineno:funcname\n<total%>\n(<self%>)\n<calls>×`
+_G2D_LABEL_RE = re.compile(
+    r'^(?P<module>[^:]+):(?P<line>\d+):(?P<func>.+?)(?:\\n(?P<calls>[\d.]+)×)?$'
+)
+_G2D_NODE_RE = re.compile(r'^\s*(?P<id>\d+)\s*\[.*\blabel="(?P<label>(?:[^"\\]|\\.)*)".*\];\s*$')
+_G2D_EDGE_RE = re.compile(r'^\s*(?P<src>\d+)\s*->\s*(?P<dst>\d+)\b')
+
+
+def parse_gprof2dot(dot: str, source_stems: set) -> tuple:
+    r"""gprof2dot の DOT を解析し、source_stems のモジュールに関わる呼び出しを取り出す。
+
+    Returns:
+        nodes: dict[id, {module, line, func, qname, calls, in_source}]
+        edges: list[(src_id, dst_id)]  callee が source のもの（caller は外部でも可 = dispatch 元を見せる）
+    """
+    nodes = {}
+    for line in dot.splitlines():
+        m = _G2D_NODE_RE.match(line)
+        if not m:
+            continue
+        first = m.group("label").split("\\n")[0]
+        calls = None
+        cm = re.search(r'\\n([\d.]+)×', m.group("label"))
+        if cm:
+            calls = cm.group(1)
+        lm = re.match(r'^(?P<module>[^:]+):(?P<line>\d+):(?P<func>.+)$', first)
+        if not lm:
+            # `~:0:<built-in ...>` のような組み込みは module=~ でスキップ対象
+            nodes[m.group("id")] = {
+                "module": first.split(":")[0], "line": None, "func": first,
+                "qname": first, "calls": calls, "in_source": False,
+            }
+            continue
+        module = lm.group("module")
+        func = lm.group("func")
+        nodes[m.group("id")] = {
+            "module": module,
+            "line": int(lm.group("line")),
+            "func": func,
+            "qname": f"{module}.{func}",
+            "calls": calls,
+            "in_source": module in source_stems,
+        }
+
+    edges = []
+    seen = set()
+    for line in dot.splitlines():
+        em = _G2D_EDGE_RE.match(line)
+        if not em:
+            continue
+        src, dst = em.group("src"), em.group("dst")
+        s, d = nodes.get(src), nodes.get(dst)
+        if not s or not d or not d["in_source"]:
+            continue  # callee が source のものだけ（dispatch 元は外部でも残す）
+        # 内包表記・ラムダの疑似関数（`<genexpr>` 等）はノイズになるので落とす
+        # （pyan も呼び出し対象として扱わないため比較の対象外）。
+        if s["func"].startswith("<") or d["func"].startswith("<"):
+            continue
+        if (src, dst) in seen:
+            continue
+        seen.add((src, dst))
+        edges.append((src, dst))
+    return nodes, edges
+
+
+def build_dynamic_dot(nodes: dict, edges: list) -> str:
+    """動的グラフの表示用 DOT。source 関数は濃色、外部（dispatch 元）は淡色。呼び出し回数を辺に。"""
+    used = set()
+    for s, d in edges:
+        used.add(s)
+        used.add(d)
+    lines = [
+        "digraph dyncallgraph {",
+        '  rankdir="LR";',
+        '  node [shape="box", style="rounded,filled", fontname="sans-serif", fontsize="10"];',
+        '  edge [color="#5b6b7f"];',
+    ]
+    for nid in sorted(used):
+        n = nodes.get(nid)
+        if not n:
+            continue
+        label = n["qname"].replace('"', '\\"')
+        fill = "#e9f6ec" if n["in_source"] else "#f0f0f0"
+        lines.append(f'  "{nid}" [label="{label}", fillcolor="{fill}"];')
+    for s, d in edges:
+        calls = nodes[s].get("calls") if nodes.get(s) else None
+        # 辺ラベルには callee 側の呼び出し回数（gprof2dot はノードに calls を持つ）。
+        n_calls = nodes[d].get("calls")
+        elabel = f' [label="{n_calls}×"]' if n_calls else ""
+        lines.append(f'  "{s}" -> "{d}"{elabel};')
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def analyze_dynamic(test_files: list, project_dir: str, source_files: list, python_exe: str = None) -> dict:
+    """テストを cProfile 下で実行し、実行経路のコールグラフを返す（FR-6）。
+
+    ツール未導入・実行失敗でも raise せず ok=False/hint で返す（AC-5）。
+
+    Returns dict:
+        ok, error, hint
+        nodes, edges          parse_gprof2dot の結果（表示用）
+        dot                   表示用 DOT（build_dynamic_dot）
+        source_edges          両端が source の (caller_qname, callee_qname)（静的比較用）
+        executed              実行された source 関数の (module, func, line) 集合
+        n_executed            実行された source 関数数
+    """
+    if not test_files:
+        return {"ok": False, "error": "テストファイルが選ばれていません。", "hint": ""}
+    if not gprof2dot_available():
+        return {
+            "ok": False,
+            "error": "gprof2dot が未導入です。",
+            "hint": "`pip install gprof2dot` で導入してください。",
+        }
+    exe = python_exe or sys.executable
+    source_stems = {_stem(f) for f in source_files}
+
+    import tempfile
+
+    pstats_path = None
+    try:
+        fd, pstats_path = tempfile.mkstemp(suffix=".pstats")
+        os.close(fd)
+        # pytest を cProfile 下で実行（テストが source を動かす経路を記録）。
+        # cwd を project_dir にする必要があるため subprocess を直接使う。
+        try:
+            prof = subprocess.run(
+                [exe, "-m", "cProfile", "-o", pstats_path, "-m", "pytest", *test_files, "-q"],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                timeout=_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": f"プロファイル実行がタイムアウトしました（{_TIMEOUT}s）。", "hint": ""}
+        if not os.path.isfile(pstats_path) or os.path.getsize(pstats_path) == 0:
+            return {
+                "ok": False,
+                "error": "プロファイルデータを取得できませんでした（テスト実行に失敗）。",
+                "hint": (prof.stderr or prof.stdout or "").strip()[:2000] if prof else "",
+            }
+        g2d = _run(
+            [exe, "-m", "gprof2dot", "-f", "pstats", "--node-thres=0", "--edge-thres=0", pstats_path]
+        )
+        if g2d.returncode != 0 or not g2d.stdout.strip():
+            return {"ok": False, "error": "gprof2dot の変換に失敗しました。", "hint": (g2d.stderr or "")[:2000]}
+    finally:
+        if pstats_path and os.path.isfile(pstats_path):
+            os.remove(pstats_path)
+
+    nodes, edges = parse_gprof2dot(g2d.stdout, source_stems)
+    source_edges = [
+        (nodes[s]["qname"], nodes[d]["qname"])
+        for s, d in edges
+        if nodes[s]["in_source"] and nodes[d]["in_source"]
+    ]
+    # 外部（stdlib 等）→ source の辺 = 動的 dispatch で source 関数に入った経路。
+    # visitor の ast.visit → visit_* のように、静的では辿れず根として並ぶ関係（C2 の証拠）。
+    dispatch_edges = sorted(
+        {
+            (nodes[s]["qname"], nodes[d]["qname"])
+            for s, d in edges
+            if not nodes[s]["in_source"] and nodes[d]["in_source"]
+        }
+    )
+    executed = {
+        (n["module"], n["func"], n["line"])
+        for n in nodes.values()
+        if n["in_source"] and n["line"] is not None and not n["func"].startswith("<")
+    }
+    return {
+        "ok": True,
+        "error": None,
+        "hint": "",
+        "nodes": nodes,
+        "edges": edges,
+        "dot": build_dynamic_dot(nodes, edges),
+        "source_edges": source_edges,
+        "dispatch_edges": dispatch_edges,
+        "executed": executed,
+        "n_executed": len(executed),
+    }
+
+
+def _static_edge_keys(static_result: dict) -> set:
+    """静的 call_edges を (module_stem, func_last, line) キーの辺集合に正規化する。"""
+    nodes = static_result["nodes"]
+
+    def key(nid):
+        n = nodes[nid]
+        stem = _stem(n["file"]) if n["file"] else n["qname"].split(".")[0]
+        return (stem, n["short"].split(".")[-1], n["line"])
+
+    return {(key(s), key(d)) for s, d in static_result["call_edges"]}
+
+
+def _dynamic_edge_keys(dynamic_result: dict) -> set:
+    """動的 source→source 辺を同じキー体系へ正規化する。"""
+    nodes = dynamic_result["nodes"]
+    keys = set()
+    for s, d in dynamic_result["edges"]:
+        ns, nd = nodes[s], nodes[d]
+        if not (ns["in_source"] and nd["in_source"]):
+            continue
+        keys.add(
+            (
+                (ns["module"], ns["func"], ns["line"]),
+                (nd["module"], nd["func"], nd["line"]),
+            )
+        )
+    return keys
+
+
+def compare_static_dynamic(static_result: dict, dynamic_result: dict) -> dict:
+    """静的と動的の呼び出し辺を突き合わせる（FR-8, 近似）。
+
+    キーは (モジュール, 関数名, 定義行)。行番号は静的(pyan)・動的(cProfile)とも def 行を
+    指すため概ね一致するが、デコレータ等で稀にずれるので「近似」と明記して使う。
+
+    Returns:
+        only_static:  [(caller, callee)]  静的にあるが今回のテストで通らなかった呼び出し
+        only_dynamic: [(caller, callee)]  実行で通ったが静的グラフに出ていない呼び出し
+        both_count:   int
+    """
+    s = _static_edge_keys(static_result)
+    d = _dynamic_edge_keys(dynamic_result)
+
+    def fmt(pair):
+        (m1, f1, _), (m2, f2, _) = pair
+        return (f"{m1}.{f1}", f"{m2}.{f2}")
+
+    return {
+        "only_static": sorted(fmt(p) for p in (s - d)),
+        "only_dynamic": sorted(fmt(p) for p in (d - s)),
+        "both_count": len(s & d),
+    }

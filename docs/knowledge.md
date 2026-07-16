@@ -89,3 +89,15 @@ PoCの方針A（静的は pyan3 へ委譲）を実装。新モジュール `call
 - **C2（動的dispatch）は静的では出せないまま**: `visit→visit_Call` 等は pyan でも辿れず入口として並ぶ。画面キャプションで明記し「実際に通ったかは上のカバレッジで裏取り」と誘導（フェーズ2で cProfile 側を並置予定）。
 - **`use_container_width` は非推奨**（streamlit 1.59系）。`width="stretch"` を使う（st.graphviz_chart も width 対応済み）。
 - **既存テストの回帰に注意**: 横断ツリー表を足したことで AppTest の「全dataframe走査」が別列の表で KeyError を起こした。`"関数" in df.columns` で対象表を絞って修正（新パネルは列名が異なる）。
+
+### 2026-07-16 フェーズ2: 実行経路（動的）での裏取りを cProfile+gprof2dot で実装（FR-6/FR-8）
+静的グラフ（pyan3）の下に「実行経路で裏取り」を追加。テストを cProfile 下で実行し、gprof2dot でコールグラフ化して静的と突き合わせる。全127件パス（117→+10）。
+
+- **動的グラフの作り方**: `python -m cProfile -o <pstats> -m pytest <tests>` を project_dir で実行（既存カバレッジ実行とは別プロセス）→ `python -m gprof2dot -f pstats --node-thres=0 --edge-thres=0 <pstats>` で DOT 化。gprof2dot はデフォルト閾値（node 0.5% / edge 0.1%）で軽い関数を刈るので、小規模では **閾値0が必須**（PoC で確認済みの罠）。一時 pstats は finally で削除（NFR-7）。
+- **gprof2dot ラベルの解釈**: `module:lineno:funcname\n<total%>\n(<self%>)\n<calls>×`。**module はファイルの stem** で pyan の tooltip の qname の頭（＝ファイル stem）と一致するため、静的↔動的の突き合わせキーを `(module_stem, funcname, 定義行)` に揃えられる。行番号は両者とも def 行を指すので概ね一致（デコレータで稀にずれるため比較は「近似」と明記）。
+- **内包表記の疑似関数はノイズ**: cProfile は `<genexpr>`/`<listcomp>`/`<dictcomp>`/`<setcomp>`/`<lambda>` を独立コードオブジェクトとして記録する（3.11）。pyan は呼び出し対象として扱わないので、グラフ・比較の両方から `<...>` を除外しないと only_dynamic がそれらで埋まって意味が消える（実測で確認 → 除外後は差分が明快に）。
+- **C2（動的dispatch）を実データで見せられた**: source 関数への呼び出しのうち **呼び元が外部（stdlib 等）の辺** = `dispatch_edges`。sample_module（visitorパターン）で `ast.visit → sample_module.visit_BoolOp / visit_comprehension / visit_Call ...` が出る。静的（pyan含む）ではこれらは根として並ぶだけ。「静的では入口に見えるが、実行では ast.visit の getattr dispatch で呼ばれている」を画面で提示できた。
+- **突き合わせの3バケット（FR-8）**: only_static＝静的にあるが今回のテストで通らなかった呼び出し（テストの穴 or 実行時は別経路で解決）、only_dynamic＝実行で通ったが静的に無い source→source、both＝一致。sample_module では only_static=16・only_dynamic=0・both=10（only_dynamic が0なのは、静的が引けない経路が軒並み外部dispatch経由＝source→source ではないため。dispatch_edges 側に出る）。
+- **重要なUXバグ修正（ラッチ）**: `if not st.button(...): st.stop()` は one-shot。動的裏取りのチェックボックスを押すと Streamlit が再実行し、ボタンは False に戻って `st.stop()` で**解析結果ごと消える**。`st.button` を `st.session_state["analyzed"]=True` にラッチし、以降の再実行でも解析を保持するよう修正。AppTest でチェック操作を検証して再発防止。
+- **コスト**: 裏取りはチェックボックスで明示的にONにしたときだけ cProfile 実行（毎回のカバレッジ実行に加えて更にpytestを1回走らせるため）。ローカル自用前提なので許容。
+- **snakeviz（FR-7 任意）**: 起動はアプリからせず、`cProfile -o profile.pstats -m pytest ...` と `snakeviz profile.pstats` のコマンドを画面に案内するだけに留めた（ブラウザ起動系はヘッドレス/WSL2で自動で開かない、NFR-4）。

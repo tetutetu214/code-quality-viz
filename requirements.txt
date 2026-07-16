@@ -15,3 +15,8 @@ radon>=6.0
 # OS の Graphviz が必要（`sudo apt install graphviz` / `brew install graphviz`）。
 # ブラウザ上の図表示（st.graphviz_chart）だけなら Graphviz の導入は不要。
 pyan3>=1.2.0
+
+# 実行経路（動的）の裏取り: テストを cProfile（標準ライブラリ）下で実行し、その
+# pstats を gprof2dot で呼び出し回数つきのコールグラフに変換する（callgraph.py）。
+# 静的では辿れない動的 dispatch（visitor の self.visit() 等）を実行経路で裏取りする。
+gprof2dot>=2022.7.29
